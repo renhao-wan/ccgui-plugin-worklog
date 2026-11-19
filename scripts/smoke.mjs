@@ -26,6 +26,7 @@ const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "wl-smoke-"));
 const sessionRoot = path.join(workDir, "sessions");
 const repoDir = path.join(workDir, "proj");
 const storageDir = path.join(workDir, "storage");
+const pickedDir = path.join(workDir, "picked-dir");
 fs.mkdirSync(sessionRoot, { recursive: true });
 fs.mkdirSync(repoDir, { recursive: true });
 
@@ -59,6 +60,7 @@ function makeFixture() {
         content: [
           { type: "thinking", thinking: "看校验函数" },
           { type: "tool_use", name: "Edit", input: { file_path: path.join(repoDir, "login.js") } },
+          { type: "tool_use", name: "Bash", input: { command: "npm test" } },
           { type: "text", text: "已加上空密码校验。" },
         ],
       },
@@ -87,7 +89,12 @@ makeFixture();
 const states = new Map();
 let stateIdx = 0;
 let refIdx = 0;
+let effectIdx = 0;
 const refs = [];
+const pendingEffects = [];
+// effect 记录按组件分区：tab 与设置页的 effect 槽位不能互相覆盖
+const effectStores = new WeakMap();
+let effectStore = new Map();
 
 const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props, children }),
@@ -99,7 +106,9 @@ const fakeReact = {
       (v) => states.set(i, typeof v === "function" ? v(states.get(i)) : v),
     ];
   },
-  useEffect: () => {},
+  useEffect: (fn, deps) => {
+    pendingEffects.push({ i: effectIdx++, fn, deps });
+  },
   useRef: (init) => {
     const i = refIdx++;
     if (!refs[i]) refs[i] = { current: init === undefined ? null : init };
@@ -109,6 +118,55 @@ const fakeReact = {
   useMemo: (fn) => fn(),
   useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
 };
+
+function sameDeps(a, b) {
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  return a.every((d, i) => Object.is(d, b[i]));
+}
+
+function cleanupEffects(store) {
+  for (const e of store.values()) {
+    if (typeof e.cleanup === "function") {
+      try {
+        e.cleanup();
+      } catch (err) {
+        /* ignore */
+      }
+    }
+  }
+}
+
+// 渲染结束后跑 effect；依赖没变的跳过，行为和 React 一致
+function flushEffects() {
+  for (const e of pendingEffects) {
+    const prev = effectStore.get(e.i);
+    if (prev && (!e.deps || sameDeps(prev.deps, e.deps))) continue;
+    if (prev && typeof prev.cleanup === "function") {
+      try {
+        prev.cleanup();
+      } catch (err) {
+        /* 清理失败不影响测试 */
+      }
+    }
+    let cleanup = null;
+    try {
+      cleanup = e.fn();
+    } catch (err) {
+      /* effect 内的错误留给断言暴露 */
+    }
+    effectStore.set(e.i, {
+      deps: e.deps,
+      cleanup: typeof cleanup === "function" ? cleanup : null,
+    });
+  }
+  pendingEffects.length = 0;
+}
+
+function useStoreFor(comp) {
+  effectStore = effectStores.get(comp) || new Map();
+  effectStores.set(comp, effectStore);
+}
 
 // React 会调用函数组件，替身也要展开，否则拿到的只是 {type: Comp} 外壳。
 function expand(node) {
@@ -121,12 +179,48 @@ function expand(node) {
   return Object.assign({}, node, { children: (node.children || []).map(expand) });
 }
 
-function renderFresh(comp, props) {
+/**
+ * 全新渲染：清空组件状态，默认不执行 effect。
+ * 测试里每 50ms 轮询一次渲染，若每次都跑 checkEnv 会反复启动子进程。
+ */
+function renderFresh(comp, props, opts) {
+  const prev = effectStores.get(comp);
+  if (prev) cleanupEffects(prev);
+  effectStore = new Map();
+  effectStores.set(comp, effectStore);
   states.clear();
   refs.length = 0;
   stateIdx = 0;
   refIdx = 0;
-  return expand(comp(props || {}));
+  effectIdx = 0;
+  pendingEffects.length = 0;
+  const tree = expand(comp(props || {}));
+  if (opts && opts.effects) flushEffects();
+  else pendingEffects.length = 0;
+  return tree;
+}
+
+// 保留组件内部状态的重渲染：用于验证下拉、自动保存这类局部状态
+function renderKeep(comp, props) {
+  useStoreFor(comp);
+  let tree;
+  // React 允许组件在渲染期间 setState（报告面板切口吻时会同步草稿），会立即重渲染。
+  // 替身据此多跑几轮，直到状态稳定。
+  for (let pass = 0; pass < 5; pass += 1) {
+    const before = new Map(states);
+    stateIdx = 0;
+    refIdx = 0;
+    effectIdx = 0;
+    pendingEffects.length = 0;
+    tree = expand(comp(props || {}));
+    let changed = before.size !== states.size;
+    for (const [k, v] of states) {
+      if (!changed && before.get(k) !== v) changed = true;
+    }
+    if (!changed) break;
+  }
+  flushEffects();
+  return tree;
 }
 
 function walk(node, fn) {
@@ -168,7 +262,6 @@ function byClass(node, cls) {
 
 /* ------------------------------------------------------------ 假宿主 */
 
-const drafts = [];
 const storageData = new Map();
 const execCalls = [];
 const agentStarts = [];
@@ -185,6 +278,8 @@ function emit(ev) {
   for (const cb of Array.from(eventHandlers)) cb(ev);
 }
 
+// 文档存储位置可切换：custom 指向 pickedDir，data 回到默认数据目录
+let docLocation = { kind: "data", path: storageDir };
 const ctx = {
   react: fakeReact,
   pluginId: MANIFEST.id,
@@ -201,20 +296,40 @@ const ctx = {
     },
   },
   documentStorage: {
-    getLocation: async () => ({ kind: "data", path: storageDir }),
+    getLocation: async () => Object.assign({}, docLocation),
+    selectLocation: async (kind) => {
+      docLocation = kind === "custom" ? { kind: "custom", path: pickedDir } : { kind: "data", path: storageDir };
+      return Object.assign({}, docLocation);
+    },
     readText: async (rel) => {
-      const p = path.join(storageDir, rel);
+      const p = path.join(docLocation.path, rel);
       if (!fs.existsSync(p)) return null;
       return { content: fs.readFileSync(p, "utf8"), version: String(fs.statSync(p).mtimeMs) };
     },
     writeTextAtomic: async (rel, content) => {
-      const p = path.join(storageDir, rel);
+      const p = path.join(docLocation.path, rel);
       fs.mkdirSync(path.dirname(p), { recursive: true });
+      // 模拟宿主原子写入前留一份 .bak
+      if (fs.existsSync(p)) fs.writeFileSync(p + ".bak", fs.readFileSync(p));
       fs.writeFileSync(p, content, "utf8");
       return { version: String(Date.now()) };
     },
-    remove: async () => {},
-    list: async () => [],
+    remove: async (rel) => {
+      try {
+        fs.unlinkSync(path.join(docLocation.path, rel));
+      } catch (e) {
+        /* 不存在 */
+      }
+    },
+    list: async (relDir) => {
+      const dir = path.join(docLocation.path, relDir || "");
+      if (!fs.existsSync(dir)) return [];
+      return fs.readdirSync(dir).map((name) => (relDir ? relDir + name : name));
+    },
+  },
+  assets: {
+    // 系统文件夹选择器：测试里固定返回一个目录，验证选择后写回设置
+    grantDirectory: async () => ({ grantId: "smoke-grant", path: pickedDir }),
   },
   ui: {
     registerCenterTab: (def) => {
@@ -236,7 +351,6 @@ const ctx = {
     openCenterTab: () => {},
     openSettings: () => {},
   },
-  composer: { setDraft: (t) => drafts.push(t) },
   sessions: {
     selectSession: async (engine, sessionId, workspacePath) => {
       sessionOpens.push({ engine, sessionId, workspacePath });
@@ -251,7 +365,10 @@ const ctx = {
   },
   agent: {
     catalog: async () => [
+      { engine: "qoder", available: true, readOnly: true, models: [{ id: "qoder-max" }] },
       { engine: "claude", available: true, readOnly: true, models: [{ id: "claude-sonnet-5" }] },
+      { engine: "omp", available: false, readOnly: true, models: [] },
+      { engine: "codex", available: true, readOnly: true, models: [{ id: "gpt-5" }] },
     ],
     start: async (opts) => {
       agentStarts.push(opts);
@@ -334,10 +451,16 @@ storageData.set("worklog.settings.v1", {
   gitReconcile: true,
   tone: "daily",
 });
+// 启动时应该顺手清掉宿主遗留的 .bak
+fs.mkdirSync(path.join(storageDir, "reports"), { recursive: true });
+fs.writeFileSync(path.join(storageDir, "reports", "stale.md.bak"), "old");
 // 重新激活以载入设置
 dispose();
 const dispose2 = mod.default(ctx);
-await sleep(80);
+await sleep(120);
+check("启动时清理遗留的 .bak", () => {
+  assert.equal(fs.existsSync(path.join(storageDir, "reports", "stale.md.bak")), false);
+});
 
 let tree = renderFresh(tabDef.component);
 const scanButton = findByText(tree, "扫描当天");
@@ -412,38 +535,324 @@ check("生成请求带上了事实摘要与只读标记", () => {
   assert.equal(opts.readOnly, true);
   assert.match(opts.prompt, /修复登录校验/);
   assert.match(opts.prompt, /工作日报/);
+  // 事实摘要要带上「用户要求 → 助手回应」的配对和真实执行过的命令
+  assert.match(opts.prompt, /过程（/);
+  assert.match(opts.prompt, /用户：修复登录校验/);
+  assert.match(opts.prompt, /助手：已加上空密码校验/);
+  assert.match(opts.prompt, /常执行：/);
 });
 
-// 保存、插入输入框
+// 生成结果只进编辑区，不自动落盘；编辑同样不写盘，只有点「保存」才落盘
+const reportPath = path.join(storageDir, "reports", DATE + "-daily.md");
+check("生成报告不会自动写盘", () => {
+  assert.equal(fs.existsSync(reportPath), false, "生成后不应出现文件");
+  assert.match(textOf(renderFresh(tabDef.component)), /有未保存的修改/);
+});
+
 tree = renderFresh(tabDef.component);
-const saveBtn = findByText(tree, "保存");
+const reportArea = byClass(tree, "wl-textarea");
+check("报告编辑区存在", () => assert.ok(reportArea, "应有 textarea"));
+reportArea.props.onChange({ target: { value: "编辑后的报告内容" } });
+renderKeep(tabDef.component);
+await sleep(1000);
+check("编辑报告不会自动写盘", () => {
+  assert.equal(fs.existsSync(reportPath), false, "编辑后仍不应出现文件");
+});
+
+const saveTree = renderKeep(tabDef.component);
+check("报告面板不再有插入输入框按钮", () => assert.equal(findByText(saveTree, "插入输入框"), null));
+const saveArea = byClass(saveTree, "wl-textarea");
+saveArea.props.onChange({ target: { value: "手动保存的内容" } });
+const saveBtn = findByText(renderKeep(tabDef.component), "保存");
+check("报告面板提供保存按钮", () => assert.ok(saveBtn, "应有保存按钮"));
 saveBtn.props.onClick();
 await sleep(80);
-check("报告写入了 documentStorage", () => {
-  const p = path.join(storageDir, "reports", DATE + "-daily.md");
-  assert.ok(fs.existsSync(p), "应有 " + p);
-  assert.match(fs.readFileSync(p, "utf8"), /今日完成/);
+check("点保存立即写入报告文件", () => {
+  assert.match(fs.readFileSync(reportPath, "utf8"), /手动保存的内容/);
+});
+check("保存后清掉宿主留下的 .bak", () => {
+  assert.equal(fs.existsSync(reportPath + ".bak"), false, "不应留下 .bak");
 });
 
-tree = renderFresh(tabDef.component);
-const insertBtn = findByText(tree, "插入输入框");
-insertBtn.props.onClick();
-await sleep(20);
-check("插入输入框拿到完整报告", () => {
-  assert.equal(drafts.length, 1);
-  assert.match(drafts[0], /今日完成/);
+// 报告可以在「原文」和「预览」之间切换，预览只读不写盘
+const viewTree = renderKeep(tabDef.component);
+const previewBtn = findByText(viewTree, "预览");
+check("报告面板提供原文 / 预览切换", () => {
+  assert.ok(previewBtn, "应有预览按钮");
+  assert.ok(findByText(viewTree, "原文"), "应有原文按钮");
+});
+// 换成带标题、列表和表格的 Markdown，验证渲染
+const viewArea = byClass(viewTree, "wl-textarea");
+viewArea.props.onChange({
+  target: {
+    value: "# 今日完成\n\n- 修复登录\n\n| 项目 | 耗时 |\n| --- | ---: |\n| 登录校验 | 2h |\n",
+  },
+});
+renderKeep(tabDef.component);
+findByText(renderKeep(tabDef.component), "预览").props.onClick();
+const previewTree = renderKeep(tabDef.component);
+check("切到预览后渲染 Markdown，编辑区消失", () => {
+  const md = byClass(previewTree, "wl-md");
+  assert.ok(md, "应有 .wl-md 预览区");
+  assert.equal(byClass(previewTree, "wl-textarea"), null, "预览时不应再有 textarea");
+  const t = textOf(md);
+  assert.match(t, /今日完成/);
+  assert.match(t, /修复登录/);
+});
+check("预览能渲染 Markdown 表格", () => {
+  const table = byClass(previewTree, "wl-md-table");
+  assert.ok(table, "应有 .wl-md-table");
+  const t = textOf(table);
+  assert.match(t, /项目/);
+  assert.match(t, /耗时/);
+  assert.match(t, /登录校验/);
+  assert.match(t, /2h/);
+});
+check("预览不写盘", () => {
+  assert.match(fs.readFileSync(reportPath, "utf8"), /手动保存的内容/);
+});
+const sourceBtn = findByText(previewTree, "原文");
+sourceBtn.props.onClick();
+check("切回原文后恢复编辑区", () => {
+  assert.ok(byClass(renderKeep(tabDef.component), "wl-textarea"), "应回到 textarea");
 });
 
-// 设置保存
-const settingsTree = renderFresh(settingsDef.component);
-const saveSettings = findByText(settingsTree, "保存设置");
-check("设置区能渲染出保存按钮", () => assert.ok(saveSettings));
-saveSettings.props.onClick();
-await sleep(50);
-check("设置写回 storage", () => {
+// 日报 / 复盘切换：各口吻加载自己的文件，未保存草稿切回来还在
+const switchTree = renderKeep(tabDef.component);
+const swArea = byClass(switchTree, "wl-textarea");
+swArea.props.onChange({ target: { value: "日报未保存的草稿" } });
+// onChange 后要重新渲染，拿到的 onBlur 闭包才会捕获新草稿
+byClass(renderKeep(tabDef.component), "wl-textarea").props.onBlur();
+renderKeep(tabDef.component);
+
+const retroBtn = findByText(renderKeep(tabDef.component), "复盘");
+check("报告面板提供日报 / 复盘切换", () => assert.ok(retroBtn, "应有复盘按钮"));
+retroBtn.props.onClick();
+await sleep(60);
+const retroTree = renderKeep(tabDef.component);
+check("切到复盘后加载该口吻自己的内容", () => {
+  assert.match(textOf(retroTree), /尚未生成/);
+  assert.equal(byClass(retroTree, "wl-textarea"), null, "复盘还没有内容");
+});
+
+findByText(retroTree, "日报").props.onClick();
+await sleep(80);
+const backTree = renderKeep(tabDef.component);
+check("切回日报时未保存的草稿还在", () => {
+  const a = byClass(backTree, "wl-textarea");
+  assert.ok(a, "应有编辑区");
+  assert.equal(a.props.value, "日报未保存的草稿");
+  assert.match(textOf(backTree), /有未保存的修改/);
+});
+
+// 竞态：读取文件期间又切了回来，结果以最后一次点击为准
+findByText(backTree, "复盘").props.onClick();
+findByText(renderKeep(tabDef.component), "日报").props.onClick();
+await sleep(120);
+check("快速切换以最后一次点击为准", () => {
+  const a = byClass(renderKeep(tabDef.component), "wl-textarea");
+  assert.ok(a, "应停在最后点击的日报");
+  assert.equal(a.props.value, "日报未保存的草稿");
+});
+
+// 设置自动保存：没有保存按钮，改动后防抖落盘
+const settingsTree = renderFresh(settingsDef.component, {}, { effects: true });
+check("设置页说明自动保存且不再有手动按钮", () => {
+  const t = textOf(settingsTree);
+  assert.match(t, /设置会自动保存/);
+  assert.equal(findByText(settingsTree, "立即保存"), null, "不应再有手动保存按钮");
+});
+let gitCheck = null;
+walk(settingsTree, (n) => {
+  if (n.type === "input" && n.props && n.props.type === "checkbox") gitCheck = n;
+});
+check("设置页有对账开关", () => assert.ok(gitCheck));
+gitCheck.props.onChange({ target: { checked: false } });
+renderKeep(settingsDef.component);
+await sleep(650);
+check("设置改动自动写回 storage", () => {
   const saved = storageData.get("worklog.settings.v1");
   assert.ok(saved);
-  assert.equal(saved.sessionRoot, sessionRoot);
+  assert.equal(saved.gitReconcile, false);
+});
+
+// 目录字段只能来自系统选择器：只读展示 + 选择按钮，没有可填写的输入框
+const pickTree = renderKeep(settingsDef.component);
+const pickButtons = [];
+walk(pickTree, (n) => {
+  const c = n.props && n.props.className;
+  if (
+    n.type === "button" &&
+    typeof c === "string" &&
+    c.split(/\s+/).includes("wl-path-pick") &&
+    textOf(n).trim() === "选择…"
+  ) {
+    pickButtons.push(n);
+  }
+});
+check("会话根目录与引擎运行目录都有选择按钮", () => {
+  assert.equal(pickButtons.length, 2);
+});
+const settingInputs = [];
+walk(pickTree, (n) => {
+  if (n.type === "input") settingInputs.push(n);
+});
+check("设置页的目录字段只读，没有可手动填写的输入框", () => {
+  assert.ok(settingInputs.length > 0);
+  assert.ok(
+    settingInputs.every((n) => n.props.type === "checkbox"),
+    "目录不应是可编辑 input"
+  );
+});
+const pathTexts = [];
+walk(pickTree, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-path-value")) pathTexts.push(textOf(n));
+});
+check("目录字段展示当前值", () => {
+  assert.ok(pathTexts.includes(sessionRoot), "应显示会话根目录");
+  assert.ok(pathTexts.includes(repoDir), "应显示引擎运行目录");
+});
+
+pickButtons[1].props.onClick();
+await sleep(30);
+const pickedTree = renderKeep(settingsDef.component);
+const pickedTexts = [];
+walk(pickedTree, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-path-value")) pickedTexts.push(textOf(n));
+});
+check("选择目录后写回引擎运行目录", () => {
+  assert.ok(pickedTexts.includes(pickedDir));
+});
+await sleep(650);
+check("目录选择同样触发自动保存", () => {
+  const saved = storageData.get("worklog.settings.v1");
+  assert.equal(saved.workspacePath, pickedDir);
+});
+
+// 额外可执行文件目录是列表：可添加多个、可逐个移除
+const addBtn = findByText(pickedTree, "添加目录…");
+check("额外可执行目录用列表，提供添加按钮", () => assert.ok(addBtn));
+addBtn.props.onClick();
+await sleep(30);
+const addedTree = renderKeep(settingsDef.component);
+const removeBtns = [];
+walk(addedTree, (n) => {
+  if (n.type === "button" && textOf(n).trim() === "移除") removeBtns.push(n);
+});
+check("添加目录后列表多一行，可单独移除", () => {
+  assert.equal(removeBtns.length, 1);
+});
+await sleep(650);
+check("新增的可执行目录写进设置", () => {
+  const saved = storageData.get("worklog.settings.v1");
+  assert.deepEqual(saved.extraPaths, [pickedDir]);
+});
+removeBtns[0].props.onClick();
+renderKeep(settingsDef.component);
+await sleep(650);
+check("移除后列表清空并写回设置", () => {
+  const saved = storageData.get("worklog.settings.v1");
+  assert.deepEqual(saved.extraPaths, []);
+});
+
+// 报告保存目录可以脱离插件数据目录
+const changeDirBtn = findByText(renderKeep(settingsDef.component), "更改…");
+check("报告保存目录提供更改入口", () => assert.ok(changeDirBtn));
+changeDirBtn.props.onClick();
+await sleep(30);
+const changedTree = renderKeep(settingsDef.component);
+const changedTexts = [];
+walk(changedTree, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-path-value")) changedTexts.push(textOf(n));
+});
+check("更改后显示新的报告目录并给出恢复默认", () => {
+  assert.ok(changedTexts.includes(pickedDir));
+  assert.ok(findByText(changedTree, "用默认目录"));
+});
+await sleep(800);
+check("更换目录时把已有报告搬到新位置", () => {
+  const moved = path.join(pickedDir, "reports", DATE + "-daily.md");
+  assert.ok(fs.existsSync(moved), "应有 " + moved);
+  assert.match(fs.readFileSync(moved, "utf8"), /手动保存的内容/);
+  assert.equal(
+    fs.existsSync(path.join(storageDir, "reports", DATE + "-daily.md")),
+    false,
+    "源文件应从旧目录移走"
+  );
+});
+const resetDirBtn = findByText(changedTree, "用默认目录");
+resetDirBtn.props.onClick();
+await sleep(800);
+renderKeep(settingsDef.component);
+check("报告目录可以回到默认数据目录", () => {
+  assert.equal(docLocation.kind, "data");
+  assert.equal(docLocation.path, storageDir);
+});
+check("恢复默认时把文件搬回默认目录", () => {
+  const back = path.join(storageDir, "reports", DATE + "-daily.md");
+  assert.ok(fs.existsSync(back), "应有 " + back);
+  assert.equal(fs.existsSync(path.join(pickedDir, "reports", DATE + "-daily.md")), false);
+});
+
+// 下拉是自绘的（原生 select 在宿主 WebView 里不跟主题），这里检查展开、选中与联动
+check("设置页不再使用原生 select", () => {
+  let found = null;
+  walk(settingsTree, (n) => {
+    if (n.type === "select") found = n;
+  });
+  assert.equal(found, null, "不应出现 <select>");
+});
+
+const ddTree = renderFresh(settingsDef.component);
+const triggers = [];
+walk(ddTree, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-dd-trigger")) triggers.push(n);
+});
+check("生成报告区有三个下拉，当前引擎已选中且显示全名", () => {
+  assert.equal(triggers.length, 3);
+  assert.ok(textOf(triggers[0]).includes("Claude Code"), "应显示全名");
+  assert.equal(triggers[1].props.disabled, false, "已选引擎时模型下拉应可用");
+  assert.ok(textOf(triggers[2]).includes("工作日报"));
+});
+
+triggers[0].props.onClick();
+const menu = byClass(renderKeep(settingsDef.component), "wl-dd-menu");
+check("点开下拉后渲染自绘菜单", () => assert.ok(menu));
+const options = [];
+walk(menu, (n) => {
+  if (n.props && n.props.role === "option") options.push(n);
+});
+check("引擎显示全名，可用的在前、组内按首字母排序，不可用置后", () => {
+  const labels = options.map((o) => textOf(o).replace("✓", "").trim());
+  assert.deepEqual(labels, [
+    "自动（第一个可用引擎）",
+    "Claude Code",
+    "Codex",
+    "Qoder",
+    "OMP（不可用）",
+  ]);
+  assert.equal(options[1].props["aria-selected"], true);
+  assert.equal(options[4].props["aria-disabled"], true);
+});
+
+// 切回「自动」：模型同时被清空
+const optsNow = [];
+walk(byClass(renderKeep(settingsDef.component), "wl-dd-menu"), (n) => {
+  if (n.props && n.props.role === "option") optsNow.push(n);
+});
+optsNow[0].props.onClick();
+const ddAfter = renderKeep(settingsDef.component);
+const triggersAfter = [];
+walk(ddAfter, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-dd-trigger")) triggersAfter.push(n);
+});
+check("切回自动后显示占位文案", () => {
+  assert.ok(textOf(triggersAfter[0]).includes("自动（第一个可用引擎）"));
 });
 
 // 环境自检：真实执行 node --version 与 git --version
@@ -489,6 +898,40 @@ check("停止后已保存的报告文件不变", () => {
   assert.ok(fs.existsSync(p), "上一份报告应还在");
   assert.ok(!fs.readFileSync(p, "utf8").includes("SECOND-RUN-MARKER"), "文件不应被停止的轮次覆盖");
 });
+
+// 本次扫描内临时隐藏工作区：不写设置，重新扫描就回来
+tree = renderFresh(tabDef.component);
+const muteBtn = findByText(tree, "不看这个");
+check("工作区卡片提供临时隐藏入口", () => assert.ok(muteBtn));
+muteBtn.props.onClick({ preventDefault: () => {}, stopPropagation: () => {} });
+await sleep(120);
+check("隐藏后工作区从列表与 KPI 中移除，且不写设置", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.match(t, /这一屏的工作区都被你隐藏了/);
+  assert.match(t, /全部显示（1）/);
+  const saved = storageData.get("worklog.settings.v1");
+  assert.ok(!("ignoredWorkspaces" in saved), "隐藏不应写进设置");
+});
+
+const showAllBtn = findByText(renderFresh(tabDef.component), "全部显示（1）");
+check("空态提供一次性全部显示", () => assert.ok(showAllBtn));
+showAllBtn.props.onClick();
+await sleep(80);
+check("全部显示后工作区回到列表", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.match(t, /修复登录校验/);
+});
+
+// 隐藏后再扫一次，工作区应当自动回来
+tree = renderFresh(tabDef.component);
+findByText(tree, "不看这个").props.onClick({ preventDefault: () => {}, stopPropagation: () => {} });
+await sleep(80);
+findByText(renderFresh(tabDef.component), "扫描当天").props.onClick();
+const rescanned = await waitFor(() => {
+  const t = textOf(renderFresh(tabDef.component));
+  return t.includes("修复登录校验") && !t.includes("本次已隐藏");
+}, 30000);
+check("重新扫描后隐藏的临时状态清空", () => assert.ok(rescanned));
 
 dispose2();
 

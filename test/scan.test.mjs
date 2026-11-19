@@ -79,6 +79,7 @@ function makeFixture() {
           { type: "thinking", thinking: "先看控制器" },
           { type: "tool_use", name: "Read", input: { file_path: "D:\\proj\\demo\\A.java" } },
           { type: "tool_use", name: "Edit", input: { file_path: "D:\\proj\\demo\\A.java" } },
+          { type: "tool_use", name: "Edit", input: { file_path: "D:\\proj\\demo\\A.java" } },
           { type: "tool_use", name: "Write", input: { file_path: "D:\\proj\\demo\\B.java" } },
           { type: "tool_use", name: "Bash", input: { command: "git status" } },
           { type: "text", text: "已加上白名单校验。" },
@@ -135,12 +136,26 @@ test("扫描：工具统计与改过的文件", () => {
   const { dir } = makeFixture();
   const s = run(dir).sessions[0];
   assert.equal(s.tools.Read, 1);
-  assert.equal(s.tools.Edit, 1);
+  assert.equal(s.tools.Edit, 2);
   assert.equal(s.tools.Write, 1);
   assert.equal(s.tools.Bash, 1);
   assert.deepEqual(s.editedFiles.sort(), ["D:\\proj\\demo\\A.java", "D:\\proj\\demo\\B.java"]);
   assert.equal(s.commands.length, 1);
   assert.equal(s.commands[0].command, "git status");
+});
+
+test("扫描：同一文件反复编辑会记成返工信号", () => {
+  const { dir } = makeFixture();
+  const s = run(dir).sessions[0];
+  assert.deepEqual(s.hotFiles, [{ path: "D:\\proj\\demo\\A.java", edits: 2 }]);
+});
+
+test("扫描：用户要求与助手首条回应配对，内部注入不进入", () => {
+  const { dir } = makeFixture();
+  const s = run(dir).sessions[0];
+  assert.equal(s.turns.length, 1);
+  assert.equal(s.turns[0].user, "给上传接口加格式校验");
+  assert.equal(s.turns[0].reply, "已加上白名单校验。");
 });
 
 test("扫描：工具错误被记录", () => {

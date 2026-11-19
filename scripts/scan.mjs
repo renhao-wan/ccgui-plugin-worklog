@@ -25,6 +25,10 @@ const MAX_USER_TEXT = 800;
 const MAX_SUMMARY_TEXT = 1500;
 const MAX_COMMAND_TEXT = 300;
 const MAX_COMMANDS_PER_SESSION = 60;
+// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展
+const MAX_TURNS_PER_SESSION = 40;
+const MAX_TURN_USER_TEXT = 500;
+const MAX_TURN_REPLY_TEXT = 300;
 
 /** 内部注入的消息特征：这些不是用户真正输入的内容。 */
 const INTERNAL_PREFIXES = [
@@ -33,6 +37,8 @@ const INTERNAL_PREFIXES = [
   "[CCGUI internal",
   "Caveat: The messages below were generated",
   "This is a resumed session",
+  "This session is being continued",
+  "This conversation has been compacted",
   "<command-name>",
   "<local-command-stdout>",
   "[Request interrupted",
@@ -134,10 +140,12 @@ async function scanSessionFile(file, windowStart, windowEnd) {
     assistantTurns: 0,
     thinkingTurns: 0,
     userMessages: [],
+    turns: [],
     finalAssistantText: "",
     tools: {},
     toolErrors: [],
     editedFiles: new Set(),
+    fileEditCounts: {},
     commands: [],
     hours: {},
     sidechainTurns: 0,
@@ -145,6 +153,8 @@ async function scanSessionFile(file, windowStart, windowEnd) {
 
   let sawAnyMessageBeforeWindow = false;
   let sawAnyMessageInWindow = false;
+  // 当前等待助手回应的用户轮次（用于把「要求」和「怎么回应」配对）
+  let pendingTurn = null;
 
   const rl = readline.createInterface({
     input: fs.createReadStream(file.p, { encoding: "utf8" }),
@@ -218,6 +228,7 @@ async function scanSessionFile(file, windowStart, windowEnd) {
       if (s.userMessages.length < MAX_USER_MESSAGES_PER_SESSION) {
         s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });
       }
+      pendingTurn = { ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) };
       continue;
     }
 
@@ -228,6 +239,7 @@ async function scanSessionFile(file, windowStart, windowEnd) {
       s.lastSeenAt = tsRaw;
       s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;
 
+      let replyText = "";
       for (const b of content) {
         if (!b) continue;
         if (b.type === "thinking") s.thinkingTurns++;
@@ -237,7 +249,9 @@ async function scanSessionFile(file, windowStart, windowEnd) {
           const input = b.input || {};
           const fp = input.file_path || input.path || input.notebook_path;
           if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {
-            s.editedFiles.add(String(fp));
+            const key = String(fp);
+            s.editedFiles.add(key);
+            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;
           }
           if (name === "Bash" && typeof input.command === "string") {
             if (s.commands.length < MAX_COMMANDS_PER_SESSION) {
@@ -247,7 +261,18 @@ async function scanSessionFile(file, windowStart, windowEnd) {
         }
         if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
           s.finalAssistantText = b.text.trim();
+          if (!replyText) replyText = b.text.trim();
         }
+      }
+      // 把这一轮助手的第一条文字挂到待回应的用户消息上
+      if (pendingTurn && replyText) {
+        s.turns.push({
+          ts: pendingTurn.ts,
+          user: pendingTurn.user,
+          reply: clip(replyText, MAX_TURN_REPLY_TEXT),
+        });
+        if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();
+        pendingTurn = null;
       }
     }
   }
@@ -260,6 +285,13 @@ async function scanSessionFile(file, windowStart, windowEnd) {
 
   s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;
   s.editedFiles = [...s.editedFiles];
+  // 同一文件被改多次是「返工/卡点」的可靠信号
+  s.hotFiles = Object.entries(s.fileEditCounts)
+    .filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([p, n]) => ({ path: p, edits: n }));
+  delete s.fileEditCounts;
   s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);
 
   return s;

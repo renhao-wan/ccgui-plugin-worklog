@@ -93,6 +93,8 @@ if (!fs.existsSync(bundle)) {
   if (/\b(?:appCtx|ctx)\.events\.(on|emit)\s*\(/.test(src)) need("events", "ctx.events");
   if (/\b(?:appCtx|ctx)\.agent\./.test(src)) need("agent", "ctx.agent");
   if (/\b(?:appCtx|ctx)\.sessions\./.test(src)) need("host:session", "ctx.sessions");
+  if (/\b(?:appCtx|ctx)\.assets\.(grantDirectory|grantFile|listDirectories|revokeDirectory|directoryUrl)\s*\(/.test(src))
+    need("assets:directory", "ctx.assets directory picker");
 
   // exec：按 bin 字段推断需要哪一项 exec: 授权
   const bins = new Set();

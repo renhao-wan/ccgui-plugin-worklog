@@ -115,7 +115,7 @@ test("manifest：必填字段与权限形状", () => {
   const base = new Set([
     "ui:center-tab", "ui:sidebar-entry", "ui:settings-section", "ui:command",
     "composer:draft", "plugin.storage", "storage", "theme", "events", "agent",
-    "host:session", "network:none",
+    "host:session", "assets:directory", "network:none",
   ]);
   for (const p of m.permissions) {
     const ok = base.has(p) || /^exec:[A-Za-z0-9._-]+$/.test(p) || /^network:[^/]+$/.test(p);
