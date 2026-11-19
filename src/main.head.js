@@ -18,6 +18,10 @@ const MAX_PROMPT_CHARS = 20000;
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const SCAN_TIMEOUT_MS = 120 * 1000;
 const GIT_TIMEOUT_MS = 20000;
+// 扫描器对没有 cwd 的会话使用的占位符；不能当作真实目录传给引擎
+const UNKNOWN_WORKSPACE = "(未知工作区)";
+// 同时跑多少个 git 对账；工作区多时避免一次拉起几十个子进程
+const GIT_CONCURRENCY = 4;
 
 const DEFAULT_SETTINGS = {
   sessionRoot: "",
@@ -730,6 +734,8 @@ async function ensureScanner() {
   }
   if (!cur || cur.content !== SCAN_SOURCE) {
     await appCtx.documentStorage.writeTextAtomic(SCAN_REL, SCAN_SOURCE, cur ? cur.version : null);
+    // 覆盖旧扫描器时宿主会留一份 .bak，和报告一样只保留当前版本
+    await removeDoc(SCAN_REL + ".bak");
   }
   return abs;
 }
@@ -762,10 +768,9 @@ async function writeSettings(next) {
 
 /** 工作区路径的稳定键：Windows 不区分大小写，尾斜杠不参与比较。 */
 function workspaceKey(p) {
-  return String(p || "")
-    .trim()
-    .replace(/[\\/]+$/, "")
-    .toLowerCase();
+  const s = String(p || "").trim().replace(/[\\/]+$/, "");
+  // Linux 的路径区分大小写，只有 Windows 才折叠大小写
+  return isWindowsHost() ? s.toLowerCase() : s;
 }
 
 function isWindowsHost() {
@@ -958,6 +963,8 @@ async function moveStorageFiles(fromRoot, toRoot) {
 async function checkEnv(force) {
   if (!appCtx) return;
   if (!force && store.snap.env && Date.now() - store.snap.envAt < 5 * 60 * 1000) return;
+  // 中心页与设置页会同时挂载，两边都触发时只跑一轮探测
+  if (store.snap.envChecking) return;
   set({ envChecking: true });
   const env = execEnv();
   const out = {};
@@ -1062,6 +1069,23 @@ function findGit(workspace) {
   return null;
 }
 
+/** 限并发的 map：工作区多时不要一次拉起几十个 git 子进程。 */
+async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const out = new Array(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const i = next++;
+      out[i] = await fn(list[i], i);
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < Math.min(Math.max(1, limit), list.length); i += 1) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
 /** 清掉过期的扫描快照，避免 plugin-data 无限增长。 */
 async function pruneOldFacts(keepDays) {
   const days = keepDays || 30;
@@ -1074,7 +1098,7 @@ async function pruneOldFacts(keepDays) {
       const t = Date.parse(m[1] + "T00:00:00");
       if (Number.isFinite(t) && t < cutoff) {
         try {
-          await appCtx.documentStorage.remove(rel);
+          await appCtx.documentStorage.remove(withDir("runtime", rel));
         } catch (e) {
           /* 单个清理失败不影响其它文件 */
         }
@@ -1102,18 +1126,18 @@ async function doScan() {
 
     if (store.snap.settings.gitReconcile && facts.workspaces && facts.workspaces.length) {
       set({ rechecking: true });
-      const results = await Promise.all(
-        facts.workspaces
-          .filter((group) => group.workspace)
-          .map((group) =>
-            gitForWorkspace(group.workspace, facts.range.from).catch((e) => ({
-              workspace: group.workspace,
-              isRepo: false,
-              commits: [],
-              dirty: [],
-              error: safeError(e),
-            }))
-          )
+      const groups = facts.workspaces.filter(
+        (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
+      );
+      // 限并发：每个工作区要跑 3 条 git 命令，一次全开容易压垮进程创建
+      const results = await mapLimit(groups, GIT_CONCURRENCY, (group) =>
+        gitForWorkspace(group.workspace, facts.range.from).catch((e) => ({
+          workspace: group.workspace,
+          isRepo: false,
+          commits: [],
+          dirty: [],
+          error: safeError(e),
+        }))
       );
       if (store.snap.date !== date) return;
       set({ git: results, rechecking: false });
@@ -1141,6 +1165,8 @@ async function loadSavedReport(date, mode) {
     const doc = await appCtx.documentStorage.readText(reportRel(date, mode));
     return doc && doc.content ? doc.content : "";
   } catch (e) {
+    // readText 对不存在的文件返回 null；抛错说明是真的读不了（权限、存储位置失效）
+    set({ error: "读取报告失败：" + safeError(e) });
     return "";
   }
 }
@@ -1179,6 +1205,17 @@ function showReport(date, mode, diskText) {
   }
 }
 
+/**
+ * documentStorage.list(prefix) 返回的路径在不同宿主版本里可能是
+ * "reports/x.md.bak"，也可能只是 "x.md.bak"；统一补上目录前缀。
+ */
+function withDir(dir, item) {
+  const rel = String(item == null ? "" : item);
+  if (!rel) return rel;
+  if (/[\\/]/.test(rel)) return rel;
+  return String(dir).replace(/[\\/]+$/, "") + "/" + rel;
+}
+
 async function removeDoc(rel) {
   try {
     await appCtx.documentStorage.remove(rel);
@@ -1195,7 +1232,7 @@ async function cleanupReportBaks() {
     for (const item of list || []) {
       const rel = String(item);
       if (!rel.endsWith(".bak")) continue;
-      await removeDoc(/[\\/]/.test(rel) ? rel : REPORTS_DIR + "/" + rel);
+      await removeDoc(withDir(REPORTS_DIR, rel));
     }
   } catch (e) {
     /* 宿主不支持 list 时跳过 */
@@ -1279,13 +1316,19 @@ function pickCommands(commands) {
   return picked.map((c) => clip(oneLine(c.command), 120)).join("；");
 }
 
-/** 把一天的事实压成给模型看的摘要：按会话分配预算、从最近的消息往前取，
- *  避免工作区一多就把后面的整段截掉。 */
-function buildFactsDigest(facts, gitList, opts) {
+/** 把一天的事实压成给模型看的摘要：按会话分配预算、从最近的消息往前取。
+ *  预算耗尽时后面的工作区降级成一行摘要，而不是把整段工作区直接截掉。 */
+function buildFactsDigest(facts, gitList) {
   const lines = [];
+  let usedChars = 0;
+  const push = (text) => {
+    const s = String(text == null ? "" : text);
+    lines.push(s);
+    usedChars += s.length + 1;
+  };
 
-  lines.push("【日期】" + facts.range.from + (facts.range.to !== facts.range.from ? " 至 " + facts.range.to : "") + "（时区 " + facts.range.timezone + "）");
-  lines.push(
+  push("【日期】" + facts.range.from + (facts.range.to !== facts.range.from ? " 至 " + facts.range.to : "") + "（时区 " + facts.range.timezone + "）");
+  push(
     "【合计】会话 " + facts.totals.sessions + " 个 / 用户消息 " + facts.totals.userTurns +
     " 轮 / 工具调用 " + facts.totals.toolCalls + " 次 / 工具报错 " + facts.totals.toolErrors +
     " 次 / 改动文件 " + facts.totals.editedFiles + " 个"
@@ -1298,35 +1341,50 @@ function buildFactsDigest(facts, gitList, opts) {
   for (const g of gitList || []) gitByWs.set(g.workspace, g);
 
   const sessionCount = Math.max(1, facts.sessions.length);
-  const perSession = Math.max(1000, Math.min(6000, Math.floor((MAX_PROMPT_CHARS - 1200) / sessionCount)));
+  // 单会话细节预算：工作区多时压缩，但低于 400 连两条过程都放不下
+  const perSession = Math.max(400, Math.min(6000, Math.floor((MAX_PROMPT_CHARS - 1200) / sessionCount)));
 
   for (const group of facts.workspaces) {
-    lines.push("");
-    lines.push("【工作区】" + (group.workspace || "(未知工作区)"));
+    // 预算已经用完：后面的工作区保留存在感，不再输出细节
+    if (usedChars > MAX_PROMPT_CHARS - 300) {
+      push(
+        "【工作区】" + (group.workspace || UNKNOWN_WORKSPACE) +
+        "（细节已省略：会话 " + group.sessions.length + " 个，用户 " + (group.userTurns || 0) + " 轮）"
+      );
+      continue;
+    }
+
+    push("");
+    push("【工作区】" + (group.workspace || UNKNOWN_WORKSPACE));
 
     const g = gitByWs.get(group.workspace);
     if (g && g.isRepo) {
       if (g.commits.length) {
-        lines.push("git 提交 " + g.commits.length + " 次：" + g.commits.map((c) => (c.time || "") + " " + (c.hash ? c.hash + " " : "") + c.subject).join("；"));
+        push("git 提交 " + g.commits.length + " 次：" + g.commits.map((c) => (c.time || "") + " " + (c.hash ? c.hash + " " : "") + c.subject).join("；"));
       } else {
-        lines.push("git 提交：无");
+        push("git 提交：无");
       }
       if (g.dirty.length) {
-        lines.push(
+        push(
           "未提交改动 " + g.dirty.length + " 个：" +
           g.dirty.slice(0, 20).map((d) => d.code + " " + d.path).join("；")
         );
       }
     } else if (g && !g.isRepo) {
-      lines.push("git：不是仓库或无法读取");
+      push("git：不是仓库或无法读取");
     }
 
-    for (const id of group.sessions) {
+    for (let si = 0; si < group.sessions.length; si += 1) {
+      if (usedChars > MAX_PROMPT_CHARS - 200) {
+        push("  · 另有 " + (group.sessions.length - si) + " 个会话未展开");
+        break;
+      }
+      const id = group.sessions[si];
       const s = byId.get(id);
       if (!s) continue;
 
       const active = activeRanges(s.hours);
-      lines.push(
+      push(
         "- 会话 " + String(id).slice(0, 8) +
         "（" + (hhmm(s.firstSeenAt) || "?") + "–" + (hhmm(s.lastSeenAt) || "?") +
         (active ? "，活跃 " + active : "") +
@@ -1368,7 +1426,7 @@ function buildFactsDigest(facts, gitList, opts) {
       }
 
       const fixedLen = fixed.reduce((n, x) => n + x.length + 1, 0);
-      const msgBudget = Math.max(600, perSession - fixedLen - 160);
+      const msgBudget = Math.max(300, perSession - fixedLen - 160);
 
       const turns = (s.turns || []).filter((t) => t && t.user);
       const useTurns = turns.length > 0;
@@ -1378,7 +1436,7 @@ function buildFactsDigest(facts, gitList, opts) {
       let used = 0;
       for (let i = items.length - 1; i >= 0; i -= 1) {
         const it = items[i];
-        const head = hhmm(it.ts) || "?";
+        const head = (it.fromEarlierDay ? "前一天 " : "") + (hhmm(it.ts) || "?");
         const text = useTurns && it.reply
           ? head + " 用户：" + clip(oneLine(it.user), 300) + " → 助手：" + clip(oneLine(it.reply), 160)
           : head + " 用户：" + clip(oneLine(it.user), 420);
@@ -1389,19 +1447,20 @@ function buildFactsDigest(facts, gitList, opts) {
 
       if (picked.length) {
         const omitted = items.length - picked.length;
-        lines.push(
+        push(
           "  过程（" +
           (omitted ? "最近 " + picked.length + " 条，更早 " + omitted + " 条略" : "全部 " + picked.length + " 条") +
           "）："
         );
-        for (const p of picked) lines.push(p);
+        for (const p of picked) push(p);
       }
 
-      for (const f of fixed) lines.push(f);
+      for (const f of fixed) push(f);
     }
   }
 
   let out = lines.join("\n");
+  // 降级逻辑已经把总量兜住；只剩单个工作区本身超长的情况
   if (out.length > MAX_PROMPT_CHARS) out = out.slice(0, MAX_PROMPT_CHARS) + "\n（事实过长，已截断）";
   return out;
 }
@@ -1433,6 +1492,14 @@ function runAgent(prompt, startOpts, signal) {
       if (streamTimer) {
         clearTimeout(streamTimer);
         streamTimer = null;
+      }
+      // 超时 / 引擎报错 / 需要交互：宿主那边可能还在跑，主动收掉，别白花 token
+      if (err && expectedRunId && appCtx) {
+        try {
+          void appCtx.agent.interrupt(expectedRunId);
+        } catch (e) {
+          /* 轮次可能已经结束 */
+        }
       }
       if (signal) {
         try {
@@ -1466,43 +1533,53 @@ function runAgent(prompt, startOpts, signal) {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
+    // 事件可能在 start resolve 之前到达，这时还不知道本轮 runId：
+    // 先暂存，拿到 runId 后过滤并重放，避免上一轮收尾的 done/error 结束新轮次。
+    let acceptAny = false;
+    const queued = [];
+    const handleEvent = (ev) => {
+      if (settled || !ev || typeof ev !== "object") return;
+      if (ev.runId && !expectedRunId && !acceptAny) {
+        if (queued.length < 100) queued.push(ev);
+        return;
+      }
+      // 只接收本轮 runId 的事件，其他轮次的流不能混进来
+      if (expectedRunId && ev.runId && ev.runId !== expectedRunId) return;
+
+      const kind = ev.kind;
+
+      if (kind === "delta") {
+        const piece = typeof ev.data === "string" ? ev.data : ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
+        if (piece) {
+          acc += piece;
+          pushStream();
+        }
+        return;
+      }
+      if (kind === "message") {
+        const d = ev.data;
+        if (d && d.role === "assistant" && typeof d.text === "string") {
+          acc = d.text;
+          pushStream();
+        }
+        return;
+      }
+      if (kind === "done") {
+        const finalText = ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
+        finish(null, (finalText || acc).trim());
+        return;
+      }
+      if (kind === "error" || kind === "permission_denied") {
+        finish(new Error("引擎返回 " + kind));
+        return;
+      }
+      if (kind === "question") {
+        finish(new Error("引擎要求交互，后台生成无法继续"));
+      }
+    };
+
     try {
-      unlisten = appCtx.events.on("agent://" + PLUGIN_ID, (ev) => {
-        if (settled || !ev || typeof ev !== "object") return;
-        // 只接收本轮 runId 的事件，其他轮次的流不能混进来
-        if (expectedRunId && ev.runId && ev.runId !== expectedRunId) return;
-
-        const kind = ev.kind;
-
-        if (kind === "delta") {
-          const piece = typeof ev.data === "string" ? ev.data : ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
-          if (piece) {
-            acc += piece;
-            pushStream();
-          }
-          return;
-        }
-        if (kind === "message") {
-          const d = ev.data;
-          if (d && d.role === "assistant" && typeof d.text === "string") {
-            acc = d.text;
-            pushStream();
-          }
-          return;
-        }
-        if (kind === "done") {
-          const finalText = ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
-          finish(null, (finalText || acc).trim());
-          return;
-        }
-        if (kind === "error" || kind === "permission_denied") {
-          finish(new Error("引擎返回 " + kind));
-          return;
-        }
-        if (kind === "question") {
-          finish(new Error("引擎要求交互，后台生成无法继续"));
-        }
-      });
+      unlisten = appCtx.events.on("agent://" + PLUGIN_ID, handleEvent);
     } catch (e) {
       finish(e);
       return;
@@ -1515,7 +1592,13 @@ function runAgent(prompt, startOpts, signal) {
         if (id) {
           expectedRunId = id;
           set({ runId: id });
+        } else {
+          // 宿主没有返回 runId：退化为不过滤，但要把暂存的事件放出去
+          acceptAny = true;
         }
+        // 重放 start 之前到达的事件
+        const early = queued.splice(0);
+        for (const ev of early) handleEvent(ev);
         // 停止发生在 start resolve 之前时，宿主可能已经开始推事件
         if (signal && signal.aborted) finish(new Error("生成已停止"));
       })
@@ -1545,9 +1628,14 @@ async function generateReport() {
 
   try {
     const cfg = store.snap.settings;
-    const firstWs = facts.workspaces && facts.workspaces[0] ? facts.workspaces[0].workspace : "";
+    // 「(未知工作区)」是扫描器的占位符，不能当作真实目录传给引擎
+    const firstWs = (facts.workspaces || [])
+      .map((w) => w && w.workspace)
+      .find((w) => w && w !== UNKNOWN_WORKSPACE) || "";
     const workspacePath = String(cfg.workspacePath || firstWs || "").trim();
-    if (!workspacePath) throw new Error("没有可用于运行引擎的工作区，请在设置里填写一个已存在的目录。");
+    if (!workspacePath || workspacePath === UNKNOWN_WORKSPACE) {
+      throw new Error("没有可用于运行引擎的工作区，请在设置里选择「引擎运行目录」。");
+    }
 
     const catalog = await appCtx.agent.catalog(workspacePath);
     if (seq !== genSeq) return;
@@ -1566,7 +1654,7 @@ async function generateReport() {
     const preferModel = String(cfg.model || "").trim();
     const model = preferModel || (models[0] ? models[0].id : undefined);
 
-    const digest = buildFactsDigest(facts, store.snap.git, { full: true });
+    const digest = buildFactsDigest(facts, store.snap.git);
     const prompt =
       PROMPTS[targetMode].replace(/<日期>/g, facts.range.from) +
       "\n\n===== 事实 =====\n" + digest;
@@ -1773,7 +1861,7 @@ function DayTimeline(props) {
     }
     if (from == null) continue;
     rows.push({
-      name: shortPath(group.workspace) || "(未知工作区)",
+      name: shortPath(group.workspace) || UNKNOWN_WORKSPACE,
       full: group.workspace,
       from: from,
       to: Math.max(to == null ? from : to, from + 1),
@@ -1945,7 +2033,7 @@ function WorkspaceCard(props) {
       h(
         "div",
         { style: { minWidth: 0, flex: "1 1 auto" } },
-        h("h2", { className: "wl-card-title" }, shortPath(group.workspace) || "(未知工作区)"),
+        h("h2", { className: "wl-card-title" }, shortPath(group.workspace) || UNKNOWN_WORKSPACE),
         h("div", { className: "wl-card-path", title: group.workspace }, group.workspace)
       ),
       h(
@@ -2339,18 +2427,26 @@ function ReportPanel() {
 
   // 保存是唯一一次写盘，编辑过程中不产生文件
   const saveNow = () => {
-    if (!draft.trim()) return;
+    if (!draft.trim() || saveStatus === "saving") return;
+    // 先把编辑区交回 store：保存期间用户继续输入，不会被回滚
+    commit();
     const text = draft;
     const targetDate = store.snap.date;
     const targetMode = store.snap.reportMode;
+    const targetAbs = reportAbs;
     setSaveStatus("saving");
     void (async () => {
+      const sameView = () => store.snap.date === targetDate && store.snap.reportMode === targetMode;
       try {
         await saveReportText(targetDate, targetMode, text);
-        set({ report: text, reportSaved: text });
+        // 期间切了日期/口吻：磁盘缓存已由 saveReportText 更新，不要再动当前视图
+        if (!sameView()) return;
+        // 只更新「已保存到哪一版」：report 可能已经被用户继续编辑过，不能整体覆盖
+        set({ reportSaved: text });
         setSaveStatus("saved");
-        flash("报告已保存到 " + reportAbs);
+        flash("报告已保存到 " + targetAbs);
       } catch (e) {
+        if (!sameView()) return;
         setSaveStatus("error");
         set({ error: "报告保存失败：" + safeError(e) });
       }
@@ -2465,7 +2561,7 @@ function ReportPanel() {
             {
               className: "wl-btn",
               title: "保存到 " + reportAbs,
-              disabled: saveStatus === "saving",
+              disabled: saveStatus === "saving" || snap.generating,
               onClick: () => saveNow(),
             },
             saveStatus === "saving" ? "保存中…" : "保存"
@@ -3304,6 +3400,27 @@ export default function activate(ctx) {
 
   return () => {
     if (toastTimer) clearTimeout(toastTimer);
+    // 卸载/热重载时收掉进行中的生成：abort 会停掉计时器与事件监听，
+    // 再 interrupt 一次兜住 start 尚未 resolve、runId 还没回填的情况。
+    genSeq += 1;
+    const ctrl = activeAbort;
+    activeAbort = null;
+    if (ctrl) {
+      try {
+        ctrl.abort();
+      } catch (e) {
+        /* 已结束 */
+      }
+    }
+    const runId = store.snap.runId;
+    if (runId && appCtx) {
+      try {
+        void appCtx.agent.interrupt(runId);
+      } catch (e) {
+        /* 轮次可能已经结束 */
+      }
+    }
+    set({ generating: false, streamText: "", runId: "" });
     for (const d of disposers) {
       try {
         if (typeof d === "function") d();

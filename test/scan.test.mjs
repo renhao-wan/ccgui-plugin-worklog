@@ -224,3 +224,136 @@ test("扫描：字符串形式的用户消息也要计入", () => {
     ["帮我修一下登录 bug"]
   );
 });
+
+test("扫描：以 HTML 标签开头的真实输入不会被当成内部注入", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-html-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-html", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [
+    {
+      ...base,
+      type: "user",
+      timestamp: at(12, 0),
+      message: { role: "user", content: '<div class="card">样式不对</div>' },
+    },
+    {
+      ...base,
+      type: "user",
+      timestamp: at(12, 1),
+      message: { role: "user", content: "<task-notification>内部注入</task-notification>" },
+    },
+    {
+      ...base,
+      type: "assistant",
+      timestamp: at(12, 2),
+      message: { role: "assistant", content: [{ type: "text", text: "好的" }] },
+    },
+  ];
+  fs.writeFileSync(path.join(projectDir, "s.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const s = run(dir).sessions[0];
+  assert.deepEqual(s.userMessages.map((m) => m.text), ['<div class="card">样式不对</div>']);
+});
+
+test("扫描：用户消息超过上限时保留最近的", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-cap-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-cap", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [];
+  for (let i = 0; i < 85; i += 1) {
+    rows.push({
+      ...base,
+      type: "user",
+      timestamp: at(9, 0),
+      message: { role: "user", content: [{ type: "text", text: "m" + i }] },
+    });
+  }
+  fs.writeFileSync(path.join(projectDir, "s.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const s = run(dir).sessions[0];
+  assert.equal(s.userMessages.length, 80);
+  assert.equal(s.userMessages[0].text, "m5", "应丢掉最早的 5 条");
+  assert.equal(s.userMessages[79].text, "m84");
+});
+
+test("扫描：跨天会话的首次回应会配对到前一天的要求", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-carry-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-carry", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [
+    {
+      ...base,
+      type: "user",
+      timestamp: at(-1),
+      message: { role: "user", content: [{ type: "text", text: "昨天没做完的接口" }] },
+    },
+    {
+      ...base,
+      type: "assistant",
+      timestamp: at(0, 5),
+      message: { role: "assistant", content: [{ type: "text", text: "今天继续把它补完" }] },
+    },
+  ];
+  fs.writeFileSync(path.join(projectDir, "s.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const s = run(dir).sessions[0];
+  assert.equal(s.turns.length, 1);
+  assert.equal(s.turns[0].user, "昨天没做完的接口");
+  assert.equal(s.turns[0].fromEarlierDay, true);
+});
+
+test("扫描：连续多条用户消息会合并成同一轮要求", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-merge-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-merge", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [
+    {
+      ...base,
+      type: "user",
+      timestamp: at(13, 0),
+      message: { role: "user", content: [{ type: "text", text: "先加校验" }] },
+    },
+    {
+      ...base,
+      type: "user",
+      timestamp: at(13, 1),
+      message: { role: "user", content: [{ type: "text", text: "图片也要限制" }] },
+    },
+    {
+      ...base,
+      type: "assistant",
+      timestamp: at(13, 2),
+      message: { role: "assistant", content: [{ type: "text", text: "两处都加好了" }] },
+    },
+  ];
+  fs.writeFileSync(path.join(projectDir, "s.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const s = run(dir).sessions[0];
+  assert.equal(s.turns.length, 1);
+  assert.equal(s.turns[0].user, "先加校验 / 图片也要限制");
+  assert.equal(s.turns[0].reply, "两处都加好了");
+});
+
+test("扫描：指定目录不存在时明确失败", () => {
+  const missing = path.join(os.tmpdir(), "worklog-missing-" + Date.now());
+  let err = null;
+  try {
+    execFileSync(process.execPath, [SCAN, "--root", missing, "--date", DATE], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, "应非零退出");
+  assert.notEqual(err.status, 0);
+  assert.match(String(err.stderr || ""), /会话根目录不存在/);
+});

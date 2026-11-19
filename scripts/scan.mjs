@@ -25,22 +25,39 @@ const MAX_USER_TEXT = 800;
 const MAX_SUMMARY_TEXT = 1500;
 const MAX_COMMAND_TEXT = 300;
 const MAX_COMMANDS_PER_SESSION = 60;
+const MAX_TOOL_ERRORS_PER_SESSION = 50;
 // 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展
 const MAX_TURNS_PER_SESSION = 40;
 const MAX_TURN_USER_TEXT = 500;
 const MAX_TURN_REPLY_TEXT = 300;
+// 用户连续发言、助手还没回应时先排队的上限
+const MAX_PENDING_TURNS = 5;
 
-/** 内部注入的消息特征：这些不是用户真正输入的内容。 */
+/** 内部注入的消息特征：这些不是用户真正输入的内容。
+ *  只列已知标签，不用裸 "<" 兜底——用户会粘贴 HTML/XML/JSX，
+ *  那种消息是真实需求，不能吞掉。 */
 const INTERNAL_PREFIXES = [
-  "<",
+  "<task-notification",
+  "<fork-boilerplate",
+  "<command-message",
+  "<command-name>",
+  "<command-args>",
+  "<local-command-stdout>",
+  "<local-command-stderr>",
+  "<local-command-caveat>",
+  "<system-reminder>",
+  "<user-prompt-submit-hook>",
+  "<bash-input>",
+  "<bash-stdout>",
+  "<bash-stderr>",
+  "<ide_opened_file>",
+  "<ide_selection>",
   "Base directory for this skill:",
   "[CCGUI internal",
   "Caveat: The messages below were generated",
   "This is a resumed session",
   "This session is being continued",
   "This conversation has been compacted",
-  "<command-name>",
-  "<local-command-stdout>",
   "[Request interrupted",
 ];
 
@@ -97,7 +114,8 @@ function collectFiles(dir, sinceMs, out) {
       } catch {
         continue;
       }
-      // mtime 早于起始日的文件不可能含当天消息，直接跳过
+      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。
+      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。
       if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });
     }
   }
@@ -114,6 +132,15 @@ function textBlocks(content) {
 
 function isToolResult(content) {
   return Array.isArray(content) && content.some((b) => b && b.type === "tool_result");
+}
+
+/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */
+function messageContent(msg) {
+  if (!msg) return null;
+  const c = msg.content;
+  if (typeof c === "string") return c.trim() ? [{ type: "text", text: c }] : [];
+  if (Array.isArray(c)) return c;
+  return null;
 }
 
 /** 截断，保留首尾；避免把大段附件写进结果。 */
@@ -153,8 +180,10 @@ async function scanSessionFile(file, windowStart, windowEnd) {
 
   let sawAnyMessageBeforeWindow = false;
   let sawAnyMessageInWindow = false;
-  // 当前等待助手回应的用户轮次（用于把「要求」和「怎么回应」配对）
-  let pendingTurn = null;
+  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对
+  let pendingTurns = [];
+  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失
+  let carryTurn = null;
 
   const rl = readline.createInterface({
     input: fs.createReadStream(file.p, { encoding: "utf8" }),
@@ -179,22 +208,31 @@ async function scanSessionFile(file, windowStart, windowEnd) {
     const ts = typeof tsRaw === "string" ? Date.parse(tsRaw) : NaN;
     if (!Number.isFinite(ts)) continue;
 
-    if (ts < windowStart) sawAnyMessageBeforeWindow = true;
-    if (ts < windowStart || ts >= windowEnd) continue;
-
-    const msg = o.message;
-    if (!msg) continue;
-
-    // content 可能是块数组，也可能是字符串：CLI 的内部注入、
-    // 部分续接消息与简单用户输入都会以纯字符串落盘。
-    let content;
-    if (typeof msg.content === "string") {
-      content = msg.content.trim() ? [{ type: "text", text: msg.content }] : [];
-    } else if (Array.isArray(msg.content)) {
-      content = msg.content;
-    } else {
+    if (ts < windowStart) {
+      sawAnyMessageBeforeWindow = true;
+      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对
+      if (o.type === "user" && !o.isSidechain) {
+        const early = messageContent(o.message);
+        if (early && !isToolResult(early)) {
+          const text = textBlocks(early).join("\n").trim();
+          if (text && !isInternalText(text)) {
+            carryTurn = {
+              ts: tsRaw,
+              user: clip(text, MAX_TURN_USER_TEXT),
+              fromEarlierDay: true,
+            };
+          }
+        }
+      }
       continue;
     }
+    if (ts >= windowEnd) continue;
+
+    const msg = o.message;
+    // content 可能是块数组，也可能是字符串：CLI 的内部注入、
+    // 部分续接消息与简单用户输入都会以纯字符串落盘。
+    const content = messageContent(msg);
+    if (content === null) continue;
 
     if (o.isSidechain) {
       s.sidechainTurns++;
@@ -212,6 +250,8 @@ async function scanSessionFile(file, windowStart, windowEnd) {
               ? b.content
               : "";
           s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || ""), 300) });
+          // 报错只保留最近的，避免单个会话几百条错误撑大快照
+          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();
         }
       }
 
@@ -225,10 +265,13 @@ async function scanSessionFile(file, windowStart, windowEnd) {
       if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;
       s.lastSeenAt = tsRaw;
       s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;
-      if (s.userMessages.length < MAX_USER_MESSAGES_PER_SESSION) {
-        s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });
-      }
-      pendingTurn = { ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) };
+      // 保留最近的 N 条：报告关心的是会话最后在做什么
+      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });
+      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();
+      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });
+      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();
+      // 用户已经继续对话，之前窗口外的要求不再等待配对
+      carryTurn = null;
       continue;
     }
 
@@ -254,9 +297,9 @@ async function scanSessionFile(file, windowStart, windowEnd) {
             s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;
           }
           if (name === "Bash" && typeof input.command === "string") {
-            if (s.commands.length < MAX_COMMANDS_PER_SESSION) {
-              s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });
-            }
+            // 同样保留最近的命令
+            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });
+            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();
           }
         }
         if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
@@ -264,15 +307,31 @@ async function scanSessionFile(file, windowStart, windowEnd) {
           if (!replyText) replyText = b.text.trim();
         }
       }
-      // 把这一轮助手的第一条文字挂到待回应的用户消息上
-      if (pendingTurn && replyText) {
-        s.turns.push({
-          ts: pendingTurn.ts,
-          user: pendingTurn.user,
-          reply: clip(replyText, MAX_TURN_REPLY_TEXT),
-        });
-        if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();
-        pendingTurn = null;
+      // 把这一轮助手的第一条文字挂到待回应的用户消息上。
+      // 用户连续发了几条就合并成一个要求，不要只留最后一条。
+      if (replyText) {
+        let turn = null;
+        if (pendingTurns.length) {
+          turn = {
+            ts: pendingTurns[pendingTurns.length - 1].ts,
+            user: clip(pendingTurns.map((t) => t.user).join(" / "), MAX_TURN_USER_TEXT),
+            fromEarlierDay: false,
+          };
+          pendingTurns = [];
+        } else if (carryTurn) {
+          // 跨天：前一天的用户要求，当天才得到第一次回应
+          turn = carryTurn;
+          carryTurn = null;
+        }
+        if (turn) {
+          s.turns.push({
+            ts: turn.ts,
+            user: turn.user,
+            reply: clip(replyText, MAX_TURN_REPLY_TEXT),
+            fromEarlierDay: turn.fromEarlierDay === true,
+          });
+          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();
+        }
       }
     }
   }
@@ -318,6 +377,11 @@ async function main() {
   // --root auto（或缺省）= Claude Code 的默认会话目录
   const root = !args.root || args.root === "auto" ? path.join(os.homedir(), ".claude", "projects") : args.root;
   if (!root) throw new Error("缺少 --root <会话根目录>");
+  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」
+  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）
+  if (args.root && args.root !== "auto" && !fs.existsSync(root)) {
+    throw new Error("会话根目录不存在：" + root);
+  }
 
   const from = args.from || args.date;
   const to = args.to || args.date || from;

@@ -265,6 +265,7 @@ function byClass(node, cls) {
 const storageData = new Map();
 const execCalls = [];
 const agentStarts = [];
+const agentInterrupts = [];
 const sessionOpens = [];
 let agentDelayMs = 5;
 let agentRunIdx = 0;
@@ -387,7 +388,10 @@ const ctx = {
       }, agentDelayMs);
       return { runId, sessionId: null };
     },
-    interrupt: async () => true,
+    interrupt: async (runId) => {
+      agentInterrupts.push(runId);
+      return true;
+    },
   },
   bridge: {
     invoke: async (cmd, args) => {
@@ -454,6 +458,12 @@ storageData.set("worklog.settings.v1", {
 // 启动时应该顺手清掉宿主遗留的 .bak
 fs.mkdirSync(path.join(storageDir, "reports"), { recursive: true });
 fs.writeFileSync(path.join(storageDir, "reports", "stale.md.bak"), "old");
+// 预置一份旧扫描器和一份过期的事实快照，验证首次扫描会升级并清理
+fs.mkdirSync(path.join(storageDir, "runtime"), { recursive: true });
+fs.writeFileSync(path.join(storageDir, "runtime", "scan.mjs"), "// stale scanner\n");
+const staleFactsName =
+  "facts-" + new Date(Date.now() - 40 * 86400000).toISOString().slice(0, 10) + ".json";
+fs.writeFileSync(path.join(storageDir, "runtime", staleFactsName), "{}");
 // 重新激活以载入设置
 dispose();
 const dispose2 = mod.default(ctx);
@@ -495,6 +505,15 @@ check("扫描调用的是 node，且只读源目录", () => {
   assert.ok(nodeCalls.length >= 1);
   const gitCalls = execCalls.filter((c) => c.bin === "git");
   assert.ok(gitCalls.length >= 1);
+});
+
+// 扫描器升级与事实快照清理是异步尾巴，等它落地再断言
+await sleep(400);
+check("旧扫描器被覆盖后不留下 .bak", () => {
+  assert.equal(fs.existsSync(path.join(storageDir, "runtime", "scan.mjs.bak")), false);
+});
+check("超出保留期的旧事实快照会被清理", () => {
+  assert.equal(fs.existsSync(path.join(storageDir, "runtime", staleFactsName)), false);
 });
 
 // 点击「打开会话」
@@ -654,6 +673,53 @@ check("快速切换以最后一次点击为准", () => {
   assert.ok(a, "应停在最后点击的日报");
   assert.equal(a.props.value, "日报未保存的草稿");
 });
+
+// 竞态：保存还没落盘就切换口吻，晚到的写入不得覆盖当前视图
+const origWriteText = ctx.documentStorage.writeTextAtomic;
+let releaseSave = null;
+let saveWriteStarted = false;
+ctx.documentStorage.writeTextAtomic = async (rel, content, ver) => {
+  if (rel === "reports/" + DATE + "-daily.md") {
+    saveWriteStarted = true;
+    await new Promise((resolve) => {
+      releaseSave = resolve;
+    });
+  }
+  return origWriteText(rel, content, ver);
+};
+findByText(renderKeep(tabDef.component), "保存").props.onClick();
+await waitFor(() => saveWriteStarted, 2000);
+check("保存确实进入了写盘阶段", () => assert.ok(saveWriteStarted));
+
+findByText(renderKeep(tabDef.component), "复盘").props.onClick();
+await sleep(80);
+releaseSave();
+await sleep(200);
+ctx.documentStorage.writeTextAtomic = origWriteText;
+
+check("保存期间切换口吻，晚到的结果不会覆盖新视图", () => {
+  const view = renderKeep(tabDef.component);
+  assert.match(textOf(view), /尚未生成/, "应停在空白的复盘");
+  assert.equal(byClass(view, "wl-textarea"), null, "不应塞回日报内容");
+});
+check("被切走的保存仍然写进了它原本的日报文件", () => {
+  assert.match(fs.readFileSync(reportPath, "utf8"), /日报未保存的草稿/);
+});
+
+findByText(renderKeep(tabDef.component), "日报").props.onClick();
+await sleep(120);
+check("切回日报后内容与磁盘一致", () => {
+  const a = byClass(renderKeep(tabDef.component), "wl-textarea");
+  assert.ok(a, "应试回日报");
+  assert.equal(a.props.value, "日报未保存的草稿");
+});
+
+// 恢复后续用例期望的报告内容
+byClass(renderKeep(tabDef.component), "wl-textarea").props.onChange({
+  target: { value: "手动保存的内容" },
+});
+findByText(renderKeep(tabDef.component), "保存").props.onClick();
+await sleep(80);
 
 // 设置自动保存：没有保存按钮，改动后防抖落盘
 const settingsTree = renderFresh(settingsDef.component, {}, { effects: true });
@@ -882,6 +948,8 @@ tree = renderFresh(tabDef.component);
 findByText(tree, "生成日报").props.onClick();
 const sawStop = await waitFor(() => !!findByText(renderFresh(tabDef.component), "停止"), 3000);
 check("生成过程中出现停止按钮", () => assert.ok(sawStop));
+// 等 start 的 Promise resolve，runId 才写进状态；停止要靠它通知宿主
+await sleep(80);
 findByText(renderFresh(tabDef.component), "停止").props.onClick();
 await sleep(800);
 
@@ -897,6 +965,10 @@ check("停止后已保存的报告文件不变", () => {
   const p = path.join(storageDir, "reports", DATE + "-daily.md");
   assert.ok(fs.existsSync(p), "上一份报告应还在");
   assert.ok(!fs.readFileSync(p, "utf8").includes("SECOND-RUN-MARKER"), "文件不应被停止的轮次覆盖");
+});
+
+check("停止时真的通知宿主中断了这一轮", () => {
+  assert.ok(agentInterrupts.includes("smoke-run-2"), "应对当前 runId 调用 interrupt，实际 " + JSON.stringify(agentInterrupts));
 });
 
 // 本次扫描内临时隐藏工作区：不写设置，重新扫描就回来

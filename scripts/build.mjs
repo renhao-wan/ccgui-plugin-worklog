@@ -19,7 +19,8 @@ const scan = fs.readFileSync(path.join(ROOT, "scripts", "scan.mjs"), "utf8");
 
 if (!head.includes(MARKER)) throw new Error("main.head.js 缺少占位符 " + MARKER);
 
-const out = head.replace(MARKER, "const SCAN_SOURCE = " + JSON.stringify(scan) + ";");
+// 用函数替换：字符串形式的替换值会把扫描器里的 $&、$' 等当成特殊模式
+const out = head.replace(MARKER, () => "const SCAN_SOURCE = " + JSON.stringify(scan) + ";");
 fs.writeFileSync(path.join(ROOT, "main.js"), out, "utf8");
 
 process.stdout.write("main.js " + Buffer.byteLength(out) + " bytes\n");

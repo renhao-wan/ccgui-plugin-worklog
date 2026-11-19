@@ -18,6 +18,10 @@ const MAX_PROMPT_CHARS = 20000;
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 const SCAN_TIMEOUT_MS = 120 * 1000;
 const GIT_TIMEOUT_MS = 20000;
+// 扫描器对没有 cwd 的会话使用的占位符；不能当作真实目录传给引擎
+const UNKNOWN_WORKSPACE = "(未知工作区)";
+// 同时跑多少个 git 对账；工作区多时避免一次拉起几十个子进程
+const GIT_CONCURRENCY = 4;
 
 const DEFAULT_SETTINGS = {
   sessionRoot: "",
@@ -66,7 +70,7 @@ function sortEngines(list) {
   });
 }
 
-const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\nimport readline from \"node:readline\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。 */\nconst INTERNAL_PREFIXES = [\n  \"<\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"<command-name>\",\n  \"<local-command-stdout>\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // mtime 早于起始日的文件不可能含当天消息，直接跳过\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd) {\n  const s = {\n    sessionId: null,\n    engine: \"claude\",\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    tools: {},\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: {},\n    commands: [],\n    hours: {},\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 当前等待助手回应的用户轮次（用于把「要求」和「怎么回应」配对）\n  let pendingTurn = null;\n\n  const rl = readline.createInterface({\n    input: fs.createReadStream(file.p, { encoding: \"utf8\" }),\n    crlfDelay: Infinity,\n  });\n\n  for await (const line of rl) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    if (o.sessionId && !s.sessionId) s.sessionId = o.sessionId;\n    if (o.cwd && !s.workspace) s.workspace = o.cwd;\n    if (o.gitBranch && !s.gitBranch) s.gitBranch = o.gitBranch;\n    if (o.version && !s.cliVersion) s.cliVersion = o.version;\n\n    const tsRaw = o.timestamp;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) sawAnyMessageBeforeWindow = true;\n    if (ts < windowStart || ts >= windowEnd) continue;\n\n    const msg = o.message;\n    if (!msg) continue;\n\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    let content;\n    if (typeof msg.content === \"string\") {\n      content = msg.content.trim() ? [{ type: \"text\", text: msg.content }] : [];\n    } else if (Array.isArray(msg.content)) {\n      content = msg.content;\n    } else {\n      continue;\n    }\n\n    if (o.isSidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (o.type === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      if (s.userMessages.length < MAX_USER_MESSAGES_PER_SESSION) {\n        s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      }\n      pendingTurn = { ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) };\n      continue;\n    }\n\n    if (o.type === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            if (s.commands.length < MAX_COMMANDS_PER_SESSION) {\n              s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            }\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上\n      if (pendingTurn && replyText) {\n        s.turns.push({\n          ts: pendingTurn.ts,\n          user: pendingTurn.user,\n          reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n        });\n        if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        pendingTurn = null;\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: {}, userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
+const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\nimport readline from \"node:readline\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\nconst MAX_TOOL_ERRORS_PER_SESSION = 50;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n// 用户连续发言、助手还没回应时先排队的上限\nconst MAX_PENDING_TURNS = 5;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。\n *  只列已知标签，不用裸 \"<\" 兜底——用户会粘贴 HTML/XML/JSX，\n *  那种消息是真实需求，不能吞掉。 */\nconst INTERNAL_PREFIXES = [\n  \"<task-notification\",\n  \"<fork-boilerplate\",\n  \"<command-message\",\n  \"<command-name>\",\n  \"<command-args>\",\n  \"<local-command-stdout>\",\n  \"<local-command-stderr>\",\n  \"<local-command-caveat>\",\n  \"<system-reminder>\",\n  \"<user-prompt-submit-hook>\",\n  \"<bash-input>\",\n  \"<bash-stdout>\",\n  \"<bash-stderr>\",\n  \"<ide_opened_file>\",\n  \"<ide_selection>\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。\n      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */\nfunction messageContent(msg) {\n  if (!msg) return null;\n  const c = msg.content;\n  if (typeof c === \"string\") return c.trim() ? [{ type: \"text\", text: c }] : [];\n  if (Array.isArray(c)) return c;\n  return null;\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd) {\n  const s = {\n    sessionId: null,\n    engine: \"claude\",\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    tools: {},\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: {},\n    commands: [],\n    hours: {},\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对\n  let pendingTurns = [];\n  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失\n  let carryTurn = null;\n\n  const rl = readline.createInterface({\n    input: fs.createReadStream(file.p, { encoding: \"utf8\" }),\n    crlfDelay: Infinity,\n  });\n\n  for await (const line of rl) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    if (o.sessionId && !s.sessionId) s.sessionId = o.sessionId;\n    if (o.cwd && !s.workspace) s.workspace = o.cwd;\n    if (o.gitBranch && !s.gitBranch) s.gitBranch = o.gitBranch;\n    if (o.version && !s.cliVersion) s.cliVersion = o.version;\n\n    const tsRaw = o.timestamp;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) {\n      sawAnyMessageBeforeWindow = true;\n      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对\n      if (o.type === \"user\" && !o.isSidechain) {\n        const early = messageContent(o.message);\n        if (early && !isToolResult(early)) {\n          const text = textBlocks(early).join(\"\\n\").trim();\n          if (text && !isInternalText(text)) {\n            carryTurn = {\n              ts: tsRaw,\n              user: clip(text, MAX_TURN_USER_TEXT),\n              fromEarlierDay: true,\n            };\n          }\n        }\n      }\n      continue;\n    }\n    if (ts >= windowEnd) continue;\n\n    const msg = o.message;\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    const content = messageContent(msg);\n    if (content === null) continue;\n\n    if (o.isSidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (o.type === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n          // 报错只保留最近的，避免单个会话几百条错误撑大快照\n          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      // 保留最近的 N 条：报告关心的是会话最后在做什么\n      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();\n      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });\n      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();\n      // 用户已经继续对话，之前窗口外的要求不再等待配对\n      carryTurn = null;\n      continue;\n    }\n\n    if (o.type === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            // 同样保留最近的命令\n            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上。\n      // 用户连续发了几条就合并成一个要求，不要只留最后一条。\n      if (replyText) {\n        let turn = null;\n        if (pendingTurns.length) {\n          turn = {\n            ts: pendingTurns[pendingTurns.length - 1].ts,\n            user: clip(pendingTurns.map((t) => t.user).join(\" / \"), MAX_TURN_USER_TEXT),\n            fromEarlierDay: false,\n          };\n          pendingTurns = [];\n        } else if (carryTurn) {\n          // 跨天：前一天的用户要求，当天才得到第一次回应\n          turn = carryTurn;\n          carryTurn = null;\n        }\n        if (turn) {\n          s.turns.push({\n            ts: turn.ts,\n            user: turn.user,\n            reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n            fromEarlierDay: turn.fromEarlierDay === true,\n          });\n          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        }\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: {}, userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」\n  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）\n  if (args.root && args.root !== \"auto\" && !fs.existsSync(root)) {\n    throw new Error(\"会话根目录不存在：\" + root);\n  }\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
 
 const CSS = `
 /* 设计方向：achromatic-ledger（浅色账本风格）。
@@ -730,6 +734,8 @@ async function ensureScanner() {
   }
   if (!cur || cur.content !== SCAN_SOURCE) {
     await appCtx.documentStorage.writeTextAtomic(SCAN_REL, SCAN_SOURCE, cur ? cur.version : null);
+    // 覆盖旧扫描器时宿主会留一份 .bak，和报告一样只保留当前版本
+    await removeDoc(SCAN_REL + ".bak");
   }
   return abs;
 }
@@ -762,10 +768,9 @@ async function writeSettings(next) {
 
 /** 工作区路径的稳定键：Windows 不区分大小写，尾斜杠不参与比较。 */
 function workspaceKey(p) {
-  return String(p || "")
-    .trim()
-    .replace(/[\\/]+$/, "")
-    .toLowerCase();
+  const s = String(p || "").trim().replace(/[\\/]+$/, "");
+  // Linux 的路径区分大小写，只有 Windows 才折叠大小写
+  return isWindowsHost() ? s.toLowerCase() : s;
 }
 
 function isWindowsHost() {
@@ -958,6 +963,8 @@ async function moveStorageFiles(fromRoot, toRoot) {
 async function checkEnv(force) {
   if (!appCtx) return;
   if (!force && store.snap.env && Date.now() - store.snap.envAt < 5 * 60 * 1000) return;
+  // 中心页与设置页会同时挂载，两边都触发时只跑一轮探测
+  if (store.snap.envChecking) return;
   set({ envChecking: true });
   const env = execEnv();
   const out = {};
@@ -1062,6 +1069,23 @@ function findGit(workspace) {
   return null;
 }
 
+/** 限并发的 map：工作区多时不要一次拉起几十个 git 子进程。 */
+async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const out = new Array(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const i = next++;
+      out[i] = await fn(list[i], i);
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < Math.min(Math.max(1, limit), list.length); i += 1) workers.push(worker());
+  await Promise.all(workers);
+  return out;
+}
+
 /** 清掉过期的扫描快照，避免 plugin-data 无限增长。 */
 async function pruneOldFacts(keepDays) {
   const days = keepDays || 30;
@@ -1074,7 +1098,7 @@ async function pruneOldFacts(keepDays) {
       const t = Date.parse(m[1] + "T00:00:00");
       if (Number.isFinite(t) && t < cutoff) {
         try {
-          await appCtx.documentStorage.remove(rel);
+          await appCtx.documentStorage.remove(withDir("runtime", rel));
         } catch (e) {
           /* 单个清理失败不影响其它文件 */
         }
@@ -1102,18 +1126,18 @@ async function doScan() {
 
     if (store.snap.settings.gitReconcile && facts.workspaces && facts.workspaces.length) {
       set({ rechecking: true });
-      const results = await Promise.all(
-        facts.workspaces
-          .filter((group) => group.workspace)
-          .map((group) =>
-            gitForWorkspace(group.workspace, facts.range.from).catch((e) => ({
-              workspace: group.workspace,
-              isRepo: false,
-              commits: [],
-              dirty: [],
-              error: safeError(e),
-            }))
-          )
+      const groups = facts.workspaces.filter(
+        (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
+      );
+      // 限并发：每个工作区要跑 3 条 git 命令，一次全开容易压垮进程创建
+      const results = await mapLimit(groups, GIT_CONCURRENCY, (group) =>
+        gitForWorkspace(group.workspace, facts.range.from).catch((e) => ({
+          workspace: group.workspace,
+          isRepo: false,
+          commits: [],
+          dirty: [],
+          error: safeError(e),
+        }))
       );
       if (store.snap.date !== date) return;
       set({ git: results, rechecking: false });
@@ -1141,6 +1165,8 @@ async function loadSavedReport(date, mode) {
     const doc = await appCtx.documentStorage.readText(reportRel(date, mode));
     return doc && doc.content ? doc.content : "";
   } catch (e) {
+    // readText 对不存在的文件返回 null；抛错说明是真的读不了（权限、存储位置失效）
+    set({ error: "读取报告失败：" + safeError(e) });
     return "";
   }
 }
@@ -1179,6 +1205,17 @@ function showReport(date, mode, diskText) {
   }
 }
 
+/**
+ * documentStorage.list(prefix) 返回的路径在不同宿主版本里可能是
+ * "reports/x.md.bak"，也可能只是 "x.md.bak"；统一补上目录前缀。
+ */
+function withDir(dir, item) {
+  const rel = String(item == null ? "" : item);
+  if (!rel) return rel;
+  if (/[\\/]/.test(rel)) return rel;
+  return String(dir).replace(/[\\/]+$/, "") + "/" + rel;
+}
+
 async function removeDoc(rel) {
   try {
     await appCtx.documentStorage.remove(rel);
@@ -1195,7 +1232,7 @@ async function cleanupReportBaks() {
     for (const item of list || []) {
       const rel = String(item);
       if (!rel.endsWith(".bak")) continue;
-      await removeDoc(/[\\/]/.test(rel) ? rel : REPORTS_DIR + "/" + rel);
+      await removeDoc(withDir(REPORTS_DIR, rel));
     }
   } catch (e) {
     /* 宿主不支持 list 时跳过 */
@@ -1279,13 +1316,19 @@ function pickCommands(commands) {
   return picked.map((c) => clip(oneLine(c.command), 120)).join("；");
 }
 
-/** 把一天的事实压成给模型看的摘要：按会话分配预算、从最近的消息往前取，
- *  避免工作区一多就把后面的整段截掉。 */
-function buildFactsDigest(facts, gitList, opts) {
+/** 把一天的事实压成给模型看的摘要：按会话分配预算、从最近的消息往前取。
+ *  预算耗尽时后面的工作区降级成一行摘要，而不是把整段工作区直接截掉。 */
+function buildFactsDigest(facts, gitList) {
   const lines = [];
+  let usedChars = 0;
+  const push = (text) => {
+    const s = String(text == null ? "" : text);
+    lines.push(s);
+    usedChars += s.length + 1;
+  };
 
-  lines.push("【日期】" + facts.range.from + (facts.range.to !== facts.range.from ? " 至 " + facts.range.to : "") + "（时区 " + facts.range.timezone + "）");
-  lines.push(
+  push("【日期】" + facts.range.from + (facts.range.to !== facts.range.from ? " 至 " + facts.range.to : "") + "（时区 " + facts.range.timezone + "）");
+  push(
     "【合计】会话 " + facts.totals.sessions + " 个 / 用户消息 " + facts.totals.userTurns +
     " 轮 / 工具调用 " + facts.totals.toolCalls + " 次 / 工具报错 " + facts.totals.toolErrors +
     " 次 / 改动文件 " + facts.totals.editedFiles + " 个"
@@ -1298,35 +1341,50 @@ function buildFactsDigest(facts, gitList, opts) {
   for (const g of gitList || []) gitByWs.set(g.workspace, g);
 
   const sessionCount = Math.max(1, facts.sessions.length);
-  const perSession = Math.max(1000, Math.min(6000, Math.floor((MAX_PROMPT_CHARS - 1200) / sessionCount)));
+  // 单会话细节预算：工作区多时压缩，但低于 400 连两条过程都放不下
+  const perSession = Math.max(400, Math.min(6000, Math.floor((MAX_PROMPT_CHARS - 1200) / sessionCount)));
 
   for (const group of facts.workspaces) {
-    lines.push("");
-    lines.push("【工作区】" + (group.workspace || "(未知工作区)"));
+    // 预算已经用完：后面的工作区保留存在感，不再输出细节
+    if (usedChars > MAX_PROMPT_CHARS - 300) {
+      push(
+        "【工作区】" + (group.workspace || UNKNOWN_WORKSPACE) +
+        "（细节已省略：会话 " + group.sessions.length + " 个，用户 " + (group.userTurns || 0) + " 轮）"
+      );
+      continue;
+    }
+
+    push("");
+    push("【工作区】" + (group.workspace || UNKNOWN_WORKSPACE));
 
     const g = gitByWs.get(group.workspace);
     if (g && g.isRepo) {
       if (g.commits.length) {
-        lines.push("git 提交 " + g.commits.length + " 次：" + g.commits.map((c) => (c.time || "") + " " + (c.hash ? c.hash + " " : "") + c.subject).join("；"));
+        push("git 提交 " + g.commits.length + " 次：" + g.commits.map((c) => (c.time || "") + " " + (c.hash ? c.hash + " " : "") + c.subject).join("；"));
       } else {
-        lines.push("git 提交：无");
+        push("git 提交：无");
       }
       if (g.dirty.length) {
-        lines.push(
+        push(
           "未提交改动 " + g.dirty.length + " 个：" +
           g.dirty.slice(0, 20).map((d) => d.code + " " + d.path).join("；")
         );
       }
     } else if (g && !g.isRepo) {
-      lines.push("git：不是仓库或无法读取");
+      push("git：不是仓库或无法读取");
     }
 
-    for (const id of group.sessions) {
+    for (let si = 0; si < group.sessions.length; si += 1) {
+      if (usedChars > MAX_PROMPT_CHARS - 200) {
+        push("  · 另有 " + (group.sessions.length - si) + " 个会话未展开");
+        break;
+      }
+      const id = group.sessions[si];
       const s = byId.get(id);
       if (!s) continue;
 
       const active = activeRanges(s.hours);
-      lines.push(
+      push(
         "- 会话 " + String(id).slice(0, 8) +
         "（" + (hhmm(s.firstSeenAt) || "?") + "–" + (hhmm(s.lastSeenAt) || "?") +
         (active ? "，活跃 " + active : "") +
@@ -1368,7 +1426,7 @@ function buildFactsDigest(facts, gitList, opts) {
       }
 
       const fixedLen = fixed.reduce((n, x) => n + x.length + 1, 0);
-      const msgBudget = Math.max(600, perSession - fixedLen - 160);
+      const msgBudget = Math.max(300, perSession - fixedLen - 160);
 
       const turns = (s.turns || []).filter((t) => t && t.user);
       const useTurns = turns.length > 0;
@@ -1378,7 +1436,7 @@ function buildFactsDigest(facts, gitList, opts) {
       let used = 0;
       for (let i = items.length - 1; i >= 0; i -= 1) {
         const it = items[i];
-        const head = hhmm(it.ts) || "?";
+        const head = (it.fromEarlierDay ? "前一天 " : "") + (hhmm(it.ts) || "?");
         const text = useTurns && it.reply
           ? head + " 用户：" + clip(oneLine(it.user), 300) + " → 助手：" + clip(oneLine(it.reply), 160)
           : head + " 用户：" + clip(oneLine(it.user), 420);
@@ -1389,19 +1447,20 @@ function buildFactsDigest(facts, gitList, opts) {
 
       if (picked.length) {
         const omitted = items.length - picked.length;
-        lines.push(
+        push(
           "  过程（" +
           (omitted ? "最近 " + picked.length + " 条，更早 " + omitted + " 条略" : "全部 " + picked.length + " 条") +
           "）："
         );
-        for (const p of picked) lines.push(p);
+        for (const p of picked) push(p);
       }
 
-      for (const f of fixed) lines.push(f);
+      for (const f of fixed) push(f);
     }
   }
 
   let out = lines.join("\n");
+  // 降级逻辑已经把总量兜住；只剩单个工作区本身超长的情况
   if (out.length > MAX_PROMPT_CHARS) out = out.slice(0, MAX_PROMPT_CHARS) + "\n（事实过长，已截断）";
   return out;
 }
@@ -1433,6 +1492,14 @@ function runAgent(prompt, startOpts, signal) {
       if (streamTimer) {
         clearTimeout(streamTimer);
         streamTimer = null;
+      }
+      // 超时 / 引擎报错 / 需要交互：宿主那边可能还在跑，主动收掉，别白花 token
+      if (err && expectedRunId && appCtx) {
+        try {
+          void appCtx.agent.interrupt(expectedRunId);
+        } catch (e) {
+          /* 轮次可能已经结束 */
+        }
       }
       if (signal) {
         try {
@@ -1466,43 +1533,53 @@ function runAgent(prompt, startOpts, signal) {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
+    // 事件可能在 start resolve 之前到达，这时还不知道本轮 runId：
+    // 先暂存，拿到 runId 后过滤并重放，避免上一轮收尾的 done/error 结束新轮次。
+    let acceptAny = false;
+    const queued = [];
+    const handleEvent = (ev) => {
+      if (settled || !ev || typeof ev !== "object") return;
+      if (ev.runId && !expectedRunId && !acceptAny) {
+        if (queued.length < 100) queued.push(ev);
+        return;
+      }
+      // 只接收本轮 runId 的事件，其他轮次的流不能混进来
+      if (expectedRunId && ev.runId && ev.runId !== expectedRunId) return;
+
+      const kind = ev.kind;
+
+      if (kind === "delta") {
+        const piece = typeof ev.data === "string" ? ev.data : ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
+        if (piece) {
+          acc += piece;
+          pushStream();
+        }
+        return;
+      }
+      if (kind === "message") {
+        const d = ev.data;
+        if (d && d.role === "assistant" && typeof d.text === "string") {
+          acc = d.text;
+          pushStream();
+        }
+        return;
+      }
+      if (kind === "done") {
+        const finalText = ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
+        finish(null, (finalText || acc).trim());
+        return;
+      }
+      if (kind === "error" || kind === "permission_denied") {
+        finish(new Error("引擎返回 " + kind));
+        return;
+      }
+      if (kind === "question") {
+        finish(new Error("引擎要求交互，后台生成无法继续"));
+      }
+    };
+
     try {
-      unlisten = appCtx.events.on("agent://" + PLUGIN_ID, (ev) => {
-        if (settled || !ev || typeof ev !== "object") return;
-        // 只接收本轮 runId 的事件，其他轮次的流不能混进来
-        if (expectedRunId && ev.runId && ev.runId !== expectedRunId) return;
-
-        const kind = ev.kind;
-
-        if (kind === "delta") {
-          const piece = typeof ev.data === "string" ? ev.data : ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
-          if (piece) {
-            acc += piece;
-            pushStream();
-          }
-          return;
-        }
-        if (kind === "message") {
-          const d = ev.data;
-          if (d && d.role === "assistant" && typeof d.text === "string") {
-            acc = d.text;
-            pushStream();
-          }
-          return;
-        }
-        if (kind === "done") {
-          const finalText = ev.data && typeof ev.data.text === "string" ? ev.data.text : "";
-          finish(null, (finalText || acc).trim());
-          return;
-        }
-        if (kind === "error" || kind === "permission_denied") {
-          finish(new Error("引擎返回 " + kind));
-          return;
-        }
-        if (kind === "question") {
-          finish(new Error("引擎要求交互，后台生成无法继续"));
-        }
-      });
+      unlisten = appCtx.events.on("agent://" + PLUGIN_ID, handleEvent);
     } catch (e) {
       finish(e);
       return;
@@ -1515,7 +1592,13 @@ function runAgent(prompt, startOpts, signal) {
         if (id) {
           expectedRunId = id;
           set({ runId: id });
+        } else {
+          // 宿主没有返回 runId：退化为不过滤，但要把暂存的事件放出去
+          acceptAny = true;
         }
+        // 重放 start 之前到达的事件
+        const early = queued.splice(0);
+        for (const ev of early) handleEvent(ev);
         // 停止发生在 start resolve 之前时，宿主可能已经开始推事件
         if (signal && signal.aborted) finish(new Error("生成已停止"));
       })
@@ -1545,9 +1628,14 @@ async function generateReport() {
 
   try {
     const cfg = store.snap.settings;
-    const firstWs = facts.workspaces && facts.workspaces[0] ? facts.workspaces[0].workspace : "";
+    // 「(未知工作区)」是扫描器的占位符，不能当作真实目录传给引擎
+    const firstWs = (facts.workspaces || [])
+      .map((w) => w && w.workspace)
+      .find((w) => w && w !== UNKNOWN_WORKSPACE) || "";
     const workspacePath = String(cfg.workspacePath || firstWs || "").trim();
-    if (!workspacePath) throw new Error("没有可用于运行引擎的工作区，请在设置里填写一个已存在的目录。");
+    if (!workspacePath || workspacePath === UNKNOWN_WORKSPACE) {
+      throw new Error("没有可用于运行引擎的工作区，请在设置里选择「引擎运行目录」。");
+    }
 
     const catalog = await appCtx.agent.catalog(workspacePath);
     if (seq !== genSeq) return;
@@ -1566,7 +1654,7 @@ async function generateReport() {
     const preferModel = String(cfg.model || "").trim();
     const model = preferModel || (models[0] ? models[0].id : undefined);
 
-    const digest = buildFactsDigest(facts, store.snap.git, { full: true });
+    const digest = buildFactsDigest(facts, store.snap.git);
     const prompt =
       PROMPTS[targetMode].replace(/<日期>/g, facts.range.from) +
       "\n\n===== 事实 =====\n" + digest;
@@ -1773,7 +1861,7 @@ function DayTimeline(props) {
     }
     if (from == null) continue;
     rows.push({
-      name: shortPath(group.workspace) || "(未知工作区)",
+      name: shortPath(group.workspace) || UNKNOWN_WORKSPACE,
       full: group.workspace,
       from: from,
       to: Math.max(to == null ? from : to, from + 1),
@@ -1945,7 +2033,7 @@ function WorkspaceCard(props) {
       h(
         "div",
         { style: { minWidth: 0, flex: "1 1 auto" } },
-        h("h2", { className: "wl-card-title" }, shortPath(group.workspace) || "(未知工作区)"),
+        h("h2", { className: "wl-card-title" }, shortPath(group.workspace) || UNKNOWN_WORKSPACE),
         h("div", { className: "wl-card-path", title: group.workspace }, group.workspace)
       ),
       h(
@@ -2339,18 +2427,26 @@ function ReportPanel() {
 
   // 保存是唯一一次写盘，编辑过程中不产生文件
   const saveNow = () => {
-    if (!draft.trim()) return;
+    if (!draft.trim() || saveStatus === "saving") return;
+    // 先把编辑区交回 store：保存期间用户继续输入，不会被回滚
+    commit();
     const text = draft;
     const targetDate = store.snap.date;
     const targetMode = store.snap.reportMode;
+    const targetAbs = reportAbs;
     setSaveStatus("saving");
     void (async () => {
+      const sameView = () => store.snap.date === targetDate && store.snap.reportMode === targetMode;
       try {
         await saveReportText(targetDate, targetMode, text);
-        set({ report: text, reportSaved: text });
+        // 期间切了日期/口吻：磁盘缓存已由 saveReportText 更新，不要再动当前视图
+        if (!sameView()) return;
+        // 只更新「已保存到哪一版」：report 可能已经被用户继续编辑过，不能整体覆盖
+        set({ reportSaved: text });
         setSaveStatus("saved");
-        flash("报告已保存到 " + reportAbs);
+        flash("报告已保存到 " + targetAbs);
       } catch (e) {
+        if (!sameView()) return;
         setSaveStatus("error");
         set({ error: "报告保存失败：" + safeError(e) });
       }
@@ -2465,7 +2561,7 @@ function ReportPanel() {
             {
               className: "wl-btn",
               title: "保存到 " + reportAbs,
-              disabled: saveStatus === "saving",
+              disabled: saveStatus === "saving" || snap.generating,
               onClick: () => saveNow(),
             },
             saveStatus === "saving" ? "保存中…" : "保存"
@@ -3304,6 +3400,27 @@ export default function activate(ctx) {
 
   return () => {
     if (toastTimer) clearTimeout(toastTimer);
+    // 卸载/热重载时收掉进行中的生成：abort 会停掉计时器与事件监听，
+    // 再 interrupt 一次兜住 start 尚未 resolve、runId 还没回填的情况。
+    genSeq += 1;
+    const ctrl = activeAbort;
+    activeAbort = null;
+    if (ctrl) {
+      try {
+        ctrl.abort();
+      } catch (e) {
+        /* 已结束 */
+      }
+    }
+    const runId = store.snap.runId;
+    if (runId && appCtx) {
+      try {
+        void appCtx.agent.interrupt(runId);
+      } catch (e) {
+        /* 轮次可能已经结束 */
+      }
+    }
+    set({ generating: false, streamText: "", runId: "" });
     for (const d of disposers) {
       try {
         if (typeof d === "function") d();
