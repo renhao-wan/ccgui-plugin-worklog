@@ -1,0 +1,30 @@
+{
+  "id": "worklog",
+  "name": "工作志",
+  "version": "0.1.0",
+  "sdkVersion": "^0.3.25",
+  "minAppVersion": "1.2.4",
+  "author": "renhao-wan",
+  "description": "把每天的会话与代码改动整理成可核对的工作日报与复盘：先本地扫描事实（不耗 token），需要时再让模型写成文字。",
+  "repo": "renhao-wan/ccgui-plugin-worklog",
+  "license": "MIT",
+  "icon": "docs/icon.png",
+  "keywords": ["worklog", "journal", "daily", "report", "retro", "claude", "review"],
+  "tier": "js",
+  "permissions": [
+    "ui:center-tab",
+    "ui:sidebar-entry",
+    "ui:settings-section",
+    "ui:command",
+    "composer:draft",
+    "plugin.storage",
+    "storage",
+    "theme",
+    "events",
+    "agent",
+    "host:session",
+    "exec:node",
+    "exec:git",
+    "network:none"
+  ]
+}

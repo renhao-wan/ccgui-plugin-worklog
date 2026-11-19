@@ -1,0 +1,18 @@
+{
+  "name": "ccgui-plugin-worklog",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "工作志：把每天的会话与代码改动整理成可核对的工作日志",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/",
+    "smoke": "node scripts/smoke.mjs",
+    "validate": "node scripts/validate-manifest.mjs",
+    "check": "npm run build && npm test && npm run smoke && npm run validate",
+    "scan": "node scripts/scan.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
