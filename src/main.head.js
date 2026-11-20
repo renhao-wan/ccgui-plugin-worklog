@@ -32,7 +32,26 @@ const DEFAULT_SETTINGS = {
   extraPaths: [],
   gitReconcile: true,
   tone: "daily",
+  // 用户自定义的报告口吻；内置三种（daily/retro/weekly）不在这里
+  customTones: [],
 };
+
+/** 扫描器目前只实现了 Claude Code 的日志适配器；其它引擎没有真实样本前不臆造。
+ *  这只限制「扫描什么日志」，不限制用哪个引擎来写报告。 */
+const SCAN_ENGINE_ID = "claude";
+const SCAN_ENGINE_LABEL = "Claude Code";
+
+/** 日期范围预设：单日 / 本周 / 自定义。 */
+const PRESETS = [
+  { value: "day", label: "单日" },
+  { value: "week", label: "本周" },
+  { value: "custom", label: "自定义" },
+];
+
+const MAX_CUSTOM_TONES = 6;
+const TONE_ID_RE = /^[a-z][a-z0-9]{0,15}$/;
+// 报告历史只给最近这么多份读大小；再多的只靠文件名列出，避免开个面板读上百个文件
+const MAX_REPORT_LIST_READ = 40;
 
 /**
  * 引擎显示名。宿主的 catalog 只回 engine id，界面上给全名更好认。
@@ -453,6 +472,71 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-save-state.is-bad { color:var(--wl-neg-ink); }
 .wl-save-bar .wl-muted { font-size:12px; color:var(--wl-muted); }
 
+/* ---------- 日期范围 ---------- */
+.wl-range { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.wl-range-inputs { display:inline-flex; align-items:center; gap:6px; }
+.wl-range-sep { font-size:12px; color:var(--wl-muted); }
+.wl-range-note { font-size:12px; color:var(--wl-muted); font-variant-numeric:tabular-nums; }
+.wl-report-range { font-size:12px; color:var(--wl-muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.wl-seg-tones { flex-wrap:wrap; }
+
+/* ---------- 报告历史 ---------- */
+.wl-history { border:1px solid var(--wl-border); border-radius:var(--wl-r-card); background:var(--wl-surface); }
+.wl-history-toggle {
+  display:flex; align-items:center; gap:8px; width:100%;
+  padding:10px 14px; border:0; background:transparent; color:var(--wl-text);
+  font:inherit; font-size:13px; text-align:left; cursor:pointer; border-radius:var(--wl-r-card);
+}
+.wl-history-toggle:hover { background:var(--wl-raised); }
+.wl-history-toggle:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
+.wl-history-toggle b { font-weight:500; }
+.wl-history-toggle .wl-muted { margin-left:auto; font-size:12px; }
+.wl-history-list { list-style:none; margin:0; padding:0 0 6px; border-top:1px solid var(--wl-rule); }
+.wl-history-row {
+  display:flex; align-items:center; gap:10px; width:100%;
+  padding:7px 14px; border:0; background:transparent; color:var(--wl-text);
+  font:inherit; font-size:12px; text-align:left; cursor:pointer;
+}
+.wl-history-row:hover:not(:disabled) { background:var(--wl-raised); }
+.wl-history-row:disabled { opacity:.5; cursor:not-allowed; }
+.wl-history-list li.is-current .wl-history-row { background:var(--wl-raised); }
+.wl-history-list li.is-current .wl-history-date { font-weight:500; }
+.wl-history-date { font-variant-numeric:tabular-nums; min-width:150px; }
+.wl-history-tone { color:var(--wl-muted); }
+.wl-history-size { margin-left:auto; color:var(--wl-faint); font-variant-numeric:tabular-nums; }
+.wl-history-empty { margin:0; padding:10px 14px 14px; font-size:12px; color:var(--wl-muted); }
+
+/* ---------- 会话 ↔ git 交叉对账 ---------- */
+.wl-cross { display:flex; flex-direction:column; gap:4px; margin-top:2px; padding-top:6px; border-top:1px dashed var(--wl-control); }
+.wl-cross-line { font-size:12px; line-height:1.6; color:var(--wl-muted); word-break:break-all; }
+.wl-cross-line b { font-weight:500; color:var(--wl-text); font-variant-numeric:tabular-nums; }
+.wl-cross-line.is-warn { color:var(--wl-warn-ink); }
+.wl-cross-line.is-muted { color:var(--wl-faint); }
+
+/* 报告里引用的会话短 ID：渲染成可点击的文字按钮 */
+.wl-md-session {
+  padding:0 3px; border:0; border-radius:3px; background:var(--wl-raised);
+  color:var(--wl-accent); font:inherit; font-size:12px; cursor:pointer;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+.wl-md-session:hover { text-decoration:underline; }
+.wl-md-session:focus-visible { outline:2px solid var(--wl-accent); outline-offset:1px; }
+
+/* ---------- 自定义口吻编辑器 ---------- */
+.wl-note-line { margin:0; font-size:13px; line-height:1.6; color:var(--wl-muted); }
+.wl-note-line code {
+  padding:1px 4px; border-radius:3px; background:var(--wl-raised);
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+}
+.wl-tones { display:flex; flex-direction:column; gap:10px; }
+.wl-tone-row {
+  display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px;
+  padding:10px 12px; border:1px solid var(--wl-border); border-radius:8px; background:var(--wl-raised);
+}
+.wl-tone-name { grid-column:1; }
+.wl-tone-row > .wl-btn { grid-column:2; }
+.wl-tone-prompt { grid-column:1 / -1; min-height:120px; background:var(--wl-surface); }
+
 /* ---------- 窄屏 ---------- */
 @media (max-width: 920px) {
   .wl-root { padding:18px 16px 40px; }
@@ -475,6 +559,12 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   .wl-axis { margin-left:76px; }
   /* 日期框收窄后，标题、日期、扫描与设置能排成一行 */
   .wl-input[type="date"] { width:120px; }
+  .wl-range { width:100%; }
+  .wl-range .wl-seg { width:100%; }
+  .wl-range .wl-seg button { flex:1 1 0; }
+  .wl-range-inputs { width:100%; }
+  .wl-range-inputs .wl-input[type="date"] { flex:1 1 0; width:auto; min-width:0; }
+  .wl-history-date { min-width:0; }
   .wl-card-meta { margin-left:0; width:100%; }
   .wl-session-head .wl-btn { margin-left:0; }
   /* 带动作的面板在窄屏上移到列表之前，别让用户滚过几百行才看到「生成」 */
@@ -560,6 +650,31 @@ const PROMPTS = {
     "## 走过的弯路",
     "## 明天怎么做得更好",
   ].join("\n"),
+  weekly: [
+    "你是一位替工程师写周报的助手。输入覆盖一段时间（<日期起> 至 <日期止>）的事实，你要按周来组织，不要写成流水账。",
+    "不要读取文件、不要调用任何工具、不要检索记忆，直接输出文字。",
+    "",
+    "事实怎么读：",
+    "- 「过程」是用户原话与助手回应的配对；跨天的会话会被标出，说明这件事持续了多天。",
+    "- 完成度以 git 提交、未提交改动、改动文件为准；只有讨论没有代码证据的，写「已讨论，尚未落地」。",
+    "- 「反复编辑」「工具报错」集中的地方，就是这个周期的主要卡点。",
+    "",
+    "写作要求：",
+    "1. 先按工作区归纳，再在区内按主题（功能、修复、调研）归并，同一件事跨越多天的写成一条，不再按天拆开。",
+    "2. 明确区分「本周完成」「仍在进行」「遇到阻碍」，每一类都要给出证据（提交、文件、报错）。",
+    "3. 不要编造事实里没有的工时、百分比或评价。",
+    "4. 每个工作区用一行说明这周在这个方向上推进了多少、卡在哪。",
+    "5. 「本周产出」用 Markdown 表格（| 工作区 | 产出 | 证据 |）。",
+    "6. 输出 Markdown，不要用代码块包裹整篇。",
+    "",
+    "结构：",
+    "# <日期> 工作周报",
+    "## 本周概览",
+    "## 按工作区推进",
+    "## 本周产出",
+    "## 卡点与阻碍",
+    "## 下周安排",
+  ].join("\n"),
 };
 
 /* ------------------------------------------------------------------ 工具 */
@@ -587,6 +702,56 @@ function nextDayStr(date) {
   if (!m) return date;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1);
   return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+}
+
+/** 日期加减天数；输入非法时原样返回。 */
+function shiftDay(date, delta) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+  if (!m) return date;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + Number(delta || 0));
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+}
+
+/** 本周一（周一为一周起点，与国内习惯一致）。 */
+function weekStart(date) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+  if (!m) return date;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const dow = d.getDay(); // 0 = 周日
+  const back = dow === 0 ? 6 : dow - 1;
+  return shiftDay(date, -back);
+}
+
+/** 把范围规范成 { from, to }；from 必须不晚于 to。 */
+function normalizeRange(range) {
+  const from = String((range && range.from) || "").trim();
+  const to = String((range && range.to) || "").trim() || from;
+  if (!from) return { from: todayStr(), to: todayStr() };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return { from: from, to: from };
+  }
+  return from <= to ? { from: from, to: to } : { from: to, to: from };
+}
+
+/** 范围的稳定键：单日就是日期本身，多日写成 from_to。报告文件名与缓存都用它。 */
+function rangeKey(range) {
+  const r = normalizeRange(range);
+  return r.from === r.to ? r.from : r.from + "_" + r.to;
+}
+
+function rangeLabel(range) {
+  const r = normalizeRange(range);
+  if (r.from === r.to) return r.from;
+  return r.from + " 至 " + r.to;
+}
+
+/** 范围覆盖的自然日数量（含首尾）。 */
+function rangeDays(range) {
+  const r = normalizeRange(range);
+  const a = Date.parse(r.from + "T00:00:00");
+  const b = Date.parse(r.to + "T00:00:00");
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 1;
+  return Math.max(1, Math.round((b - a) / 86400000) + 1);
 }
 
 function hhmm(iso) {
@@ -640,7 +805,11 @@ function hhmmFromMin(min) {
 const store = {
   snap: {
     ready: false,
-    date: todayStr(),
+    // 扫描范围：单日时 from === to。所有「当前在看哪一天」的判断都走 rangeKey()。
+    range: { from: todayStr(), to: todayStr() },
+    rangePreset: "day",
+    // 自定义范围的两个输入框；与 range 分开存，避免输入过程中被规范化打断
+    rangeDraft: { from: todayStr(), to: todayStr() },
     settings: Object.assign({}, DEFAULT_SETTINGS),
     scanning: false,
     rechecking: false,
@@ -651,6 +820,11 @@ const store = {
     report: "",
     reportSaved: "",
     reportMode: "daily",
+    // 自定义口吻（运行时从设置里同步过来，便于界面直接读）
+    customTones: [],
+    // 报告历史列表：{ rel, key, mode, size, mtime }[]
+    reportList: null,
+    reportListLoading: false,
     generating: false,
     streamText: "",
     runId: "",
@@ -757,13 +931,17 @@ async function readSettings() {
   // 存储里的值可能是手改过的脏数据，读进来先规整成字符串数组
   if (!Array.isArray(base.extraPaths)) base.extraPaths = [];
   base.extraPaths = base.extraPaths.map((p) => String(p || "").trim()).filter(Boolean);
+  base.customTones = sanitizeCustomTones(base.customTones);
+  const knownTones = Object.keys(BUILTIN_TONE_LABELS).concat(base.customTones.map((t) => t.id));
+  if (!knownTones.includes(base.tone)) base.tone = "daily";
   return base;
 }
 
 async function writeSettings(next) {
   // 先更新内存，主界面立即按新设置工作；写盘失败由调用方提示
-  set({ settings: next });
-  await appCtx.storage.set(SETTINGS_KEY, next);
+  const clean = Object.assign({}, next, { customTones: sanitizeCustomTones(next.customTones) });
+  set({ settings: clean, customTones: clean.customTones });
+  await appCtx.storage.set(SETTINGS_KEY, clean);
 }
 
 /** 工作区路径的稳定键：Windows 不区分大小写，尾斜杠不参与比较。 */
@@ -837,17 +1015,24 @@ function unmuteAll() {
 
 /* -------------------------------------------------------------- 扫描流程 */
 
-async function scanDay(date) {
+async function scanRange(range) {
   const scriptPath = await ensureScanner();
   const root = await ensureStorageRoot();
-  const factsRel = "runtime/facts-" + date + ".json";
+  const r = normalizeRange(range);
+  const key = rangeKey(r);
+  const factsRel = "runtime/facts-" + key + ".json";
   const factsAbs = joinPath(root, factsRel);
   const sessionRoot = String(store.snap.settings.sessionRoot || "").trim() || "auto";
 
   const started = Date.now();
+  const args = [scriptPath, "--root", sessionRoot, "--engine", SCAN_ENGINE_ID];
+  if (r.from === r.to) args.push("--date", r.from);
+  else args.push("--from", r.from, "--to", r.to);
+  args.push("--out", factsAbs);
+
   const res = await appCtx.bridge.invoke("plugin_exec_run", {
     bin: "node",
-    args: [scriptPath, "--root", sessionRoot, "--date", date, "--out", factsAbs],
+    args: args,
     env: execEnv(),
     timeoutMs: SCAN_TIMEOUT_MS,
   });
@@ -998,7 +1183,7 @@ async function execGit(args, timeoutMs) {
   });
 }
 
-async function gitForWorkspace(workspace, date) {
+async function gitForWorkspace(workspace, range) {
   const out = { workspace: workspace, isRepo: false, commits: [], dirty: [], error: "" };
   if (!workspace) return out;
 
@@ -1015,8 +1200,10 @@ async function gitForWorkspace(workspace, date) {
   }
   out.isRepo = true;
 
-  const since = date + "T00:00:00";
-  const until = nextDayStr(date) + "T00:00:00";
+  const r = normalizeRange(range);
+  const since = r.from + "T00:00:00";
+  // --until 是排他的：结束日的次日 00:00 才能把结束日整天算进去
+  const until = nextDayStr(r.to) + "T00:00:00";
 
   try {
     const log = await execGit([
@@ -1058,6 +1245,64 @@ async function gitForWorkspace(workspace, date) {
   }
 
   return out;
+}
+
+/* -------------------------------------------------------------- git 对账 */
+
+/** 把会话里记录的绝对路径换算成相对工作区的路径，方便和 git status 比对。 */
+function relToWorkspace(workspace, filePath) {
+  const ws = String(workspace || "").replace(/[\\/]+$/, "");
+  const f = String(filePath || "");
+  if (!ws || !f) return "";
+  const norm = (s) => s.replace(/\\/g, "/");
+  const a = norm(ws);
+  const b = norm(f);
+  const win = isWindowsHost();
+  const hit = win ? b.toLowerCase() === a.toLowerCase() : b === a;
+  if (hit) return "";
+  if (win ? b.toLowerCase().startsWith(a.toLowerCase() + "/") : b.startsWith(a + "/")) {
+    return b.slice(a.length + 1);
+  }
+  // 本来就已经是相对路径；不在这个工作区下的绝对路径也原样返回，靠调用方过滤
+  return b;
+}
+
+/**
+ * 会话改动 ↔ git 状态交叉对账。
+ * - 会话改过、git 里没有未提交改动：可能已提交，也可能被还原/丢弃，交给用户判断。
+ * - git 有未提交改动、会话没碰过：多半是这段范围之前留下的，不是这次的产出。
+ * 只做「对不上」的提示，不替用户下结论。
+ */
+function crossCheck(workspace, sessions, git) {
+  const edited = new Set();
+  for (const s of sessions || []) {
+    for (const f of s.editedFiles || []) {
+      const rel = relToWorkspace(workspace, f);
+      if (rel) edited.add(rel);
+    }
+  }
+  const dirty = new Set();
+  for (const d of (git && git.dirty) || []) {
+    const rel = String(d.path || "").replace(/\\/g, "/");
+    if (rel) dirty.add(rel);
+  }
+  const pending = [];
+  const sessionOnly = [];
+  for (const f of edited) {
+    if (dirty.has(f)) pending.push(f);
+    else sessionOnly.push(f);
+  }
+  const gitOnly = [];
+  for (const f of dirty) if (!edited.has(f)) gitOnly.push(f);
+  return {
+    edited: edited.size,
+    pending: pending.slice(0, 8),
+    pendingCount: pending.length,
+    settled: sessionOnly.slice(0, 8),
+    settledCount: sessionOnly.length,
+    gitOnly: gitOnly.slice(0, 8),
+    gitOnlyCount: gitOnly.length,
+  };
 }
 
 function findGit(workspace) {
@@ -1111,15 +1356,16 @@ async function pruneOldFacts(keepDays) {
 
 async function doScan() {
   if (store.snap.scanning) return;
-  const date = store.snap.date;
+  const range = normalizeRange(store.snap.range);
+  const key = rangeKey(range);
   const mode = store.snap.reportMode;
   // 扫描不丢编辑中的草稿：先记进内存，扫描完再放回编辑区
   stashReportDraft();
   set({ scanning: true, error: "", toast: "", facts: null, git: null, streamText: "" });
   try {
-    const facts = await scanDay(date);
-    // 扫描期间用户切了日期：这批结果属于旧日期，丢弃
-    if (store.snap.date !== date) return;
+    const facts = await scanRange(range);
+    // 扫描期间用户换了范围：这批结果属于旧范围，丢弃
+    if (rangeKey(store.snap.range) !== key) return;
     // 新一轮扫描重新给出全部工作区，上一轮临时隐藏的恢复显示
     set({ facts: facts, mutedWorkspaces: [] });
     void pruneOldFacts();
@@ -1130,8 +1376,9 @@ async function doScan() {
         (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
       );
       // 限并发：每个工作区要跑 3 条 git 命令，一次全开容易压垮进程创建
+      const gitRange = facts.range && facts.range.from ? facts.range : range;
       const results = await mapLimit(groups, GIT_CONCURRENCY, (group) =>
-        gitForWorkspace(group.workspace, facts.range.from).catch((e) => ({
+        gitForWorkspace(group.workspace, gitRange).catch((e) => ({
           workspace: group.workspace,
           isRepo: false,
           commits: [],
@@ -1139,13 +1386,13 @@ async function doScan() {
           error: safeError(e),
         }))
       );
-      if (store.snap.date !== date) return;
+      if (rangeKey(store.snap.range) !== key) return;
       set({ git: results, rechecking: false });
     }
 
-    const saved = await loadReportIntoCache(date, mode);
-    if (store.snap.date !== date || store.snap.reportMode !== mode) return;
-    showReport(date, mode, saved);
+    const saved = await loadReportIntoCache(range, mode);
+    if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
+    showReport(range, mode, saved);
   } catch (e) {
     set({ error: "扫描失败：" + safeError(e) });
   } finally {
@@ -1155,14 +1402,14 @@ async function doScan() {
 
 /* -------------------------------------------------------------- 报告读写 */
 
-function reportRel(date, mode) {
-  return REPORTS_DIR + "/" + date + "-" + mode + ".md";
+function reportRel(range, mode) {
+  return REPORTS_DIR + "/" + rangeKey(range) + "-" + mode + ".md";
 }
 
-async function loadSavedReport(date, mode) {
+async function loadSavedReport(range, mode) {
   if (!appCtx) return "";
   try {
-    const doc = await appCtx.documentStorage.readText(reportRel(date, mode));
+    const doc = await appCtx.documentStorage.readText(reportRel(range, mode));
     return doc && doc.content ? doc.content : "";
   } catch (e) {
     // readText 对不存在的文件返回 null；抛错说明是真的读不了（权限、存储位置失效）
@@ -1171,30 +1418,30 @@ async function loadSavedReport(date, mode) {
   }
 }
 
-/* 每个「日期+口吻」各留一份磁盘文本和一份未保存草稿：
-   切换日报/复盘或日期时内容不会互相覆盖，切回来还能接着改。缓存只在内存里，不写盘。 */
-const REPORT_KEY = (date, mode) => date + "|" + mode;
+/* 每个「范围+口吻」各留一份磁盘文本和一份未保存草稿：
+   切换口吻或范围时内容不会互相覆盖，切回来还能接着改。缓存只在内存里，不写盘。 */
+const REPORT_KEY = (range, mode) => rangeKey(range) + "|" + mode;
 const reportDiskText = new Map();
 const reportDraftText = new Map();
 
 /** 把当前视图的未保存草稿记进内存；已保存的内容不重复存。 */
 function stashReportDraft() {
-  const key = REPORT_KEY(store.snap.date, store.snap.reportMode);
+  const key = REPORT_KEY(store.snap.range, store.snap.reportMode);
   const text = store.snap.report || "";
   if (text.trim() && text !== store.snap.reportSaved) reportDraftText.set(key, text);
   else reportDraftText.delete(key);
 }
 
 /** 读磁盘内容并更新缓存，返回文本。 */
-async function loadReportIntoCache(date, mode) {
-  const text = await loadSavedReport(date, mode);
-  reportDiskText.set(REPORT_KEY(date, mode), text);
+async function loadReportIntoCache(range, mode) {
+  const text = await loadSavedReport(range, mode);
+  reportDiskText.set(REPORT_KEY(range, mode), text);
   return text;
 }
 
 /** 把某份报告放进编辑区：有未保存草稿优先用草稿，否则用磁盘内容。 */
-function showReport(date, mode, diskText) {
-  const key = REPORT_KEY(date, mode);
+function showReport(range, mode, diskText) {
+  const key = REPORT_KEY(range, mode);
   if (typeof diskText === "string") reportDiskText.set(key, diskText);
   const saved = reportDiskText.has(key) ? reportDiskText.get(key) : "";
   if (reportDraftText.has(key) && reportDraftText.get(key) !== saved) {
@@ -1239,8 +1486,8 @@ async function cleanupReportBaks() {
   }
 }
 
-async function saveReportText(date, mode, text) {
-  const rel = reportRel(date, mode);
+async function saveReportText(range, mode, text) {
+  const rel = reportRel(range, mode);
   let cur = null;
   try {
     cur = await appCtx.documentStorage.readText(rel);
@@ -1255,28 +1502,171 @@ async function saveReportText(date, mode, text) {
     await appCtx.documentStorage.writeTextAtomic(rel, text, again ? again.version : null);
   }
   await removeDoc(rel + ".bak");
-  reportDiskText.set(REPORT_KEY(date, mode), text);
-  reportDraftText.delete(REPORT_KEY(date, mode));
+  reportDiskText.set(REPORT_KEY(range, mode), text);
+  reportDraftText.delete(REPORT_KEY(range, mode));
 }
 
-/** 切换日期或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
+/** 切换范围或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
 let reportSwitchSeq = 0;
 
 async function switchReportMode(mode) {
   if (mode === store.snap.reportMode || store.snap.generating) return;
-  const date = store.snap.date;
+  const range = store.snap.range;
   stashReportDraft();
   reportSwitchSeq += 1;
   const seq = reportSwitchSeq;
-  const key = REPORT_KEY(date, mode);
+  const key = REPORT_KEY(range, mode);
   // 先用内存缓存立即切换，读盘完成后再校正，按钮不会卡在旧状态
   const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
   const next = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
   set({ reportMode: mode, report: next, reportSaved: savedNow, streamText: "" });
-  const text = await loadReportIntoCache(date, mode);
-  // 期间又切了模式或日期：这批结果已经过期
-  if (seq !== reportSwitchSeq || store.snap.date !== date || store.snap.reportMode !== mode) return;
-  showReport(date, mode, text);
+  const text = await loadReportIntoCache(range, mode);
+  // 期间又切了模式或范围：这批结果已经过期
+  if (
+    seq !== reportSwitchSeq ||
+    rangeKey(store.snap.range) !== rangeKey(range) ||
+    store.snap.reportMode !== mode
+  ) {
+    return;
+  }
+  showReport(range, mode, text);
+}
+
+/* ------------------------------------------------------------ 口吻与历史 */
+
+/** 内置口吻的显示名。自定义口吻用用户填的名字。 */
+const BUILTIN_TONE_LABELS = { daily: "工作日报", retro: "个人复盘", weekly: "工作周报" };
+/** 按钮上用的短名。自定义口吻的 label 本身就很短，直接复用。 */
+const BUILTIN_TONE_SHORT = { daily: "日报", retro: "复盘", weekly: "周报" };
+
+/** 所有可用口吻：[{ id, label, short, builtin }]，内置在前，自定义按创建顺序排在后面。
+ *  设置页编辑中的自定义列表可以直接传进来，不必等自动保存生效。 */
+function allTones(customList) {
+  const list = Object.keys(BUILTIN_TONE_LABELS).map((id) => ({
+    id: id,
+    label: BUILTIN_TONE_LABELS[id],
+    short: BUILTIN_TONE_SHORT[id] || BUILTIN_TONE_LABELS[id],
+    builtin: true,
+  }));
+  const custom = Array.isArray(customList)
+    ? customList
+    : Array.isArray(store.snap.settings.customTones)
+      ? store.snap.settings.customTones
+      : [];
+  for (const t of custom) {
+    // 内置 id 不能被自定义项覆盖；其余 id 都算自定义口吻
+    if (!t || !t.id || Object.prototype.hasOwnProperty.call(BUILTIN_TONE_LABELS, t.id)) continue;
+    const label = String(t.label || "").trim() || t.id;
+    list.push({ id: t.id, label: label, short: label, builtin: false });
+  }
+  return list;
+}
+
+function toneLabel(mode) {
+  const tones = allTones();
+  const hit = tones.find((t) => t.id === mode);
+  return hit ? hit.label : String(mode || "");
+}
+
+/**
+ * 取某个口吻的提示词。内置的直接用 PROMPTS；
+ * 自定义口吻存的是用户写的模板正文（不含「事实怎么读」那一段通用说明）。
+ */
+function promptFor(mode, range) {
+  const r = normalizeRange(range);
+  const builtin = PROMPTS[mode];
+  let text = builtin;
+  if (!text) {
+    const custom = (Array.isArray(store.snap.settings.customTones) ? store.snap.settings.customTones : [])
+      .find((t) => t && t.id === mode);
+    text = custom && String(custom.prompt || "").trim() ? String(custom.prompt) : "";
+    // 自定义口吻的模板只有写作要求，事实怎么读、别调工具这些通用约束要补上
+    if (text) {
+      text = [
+        "你是一位替工程师写工作记录的助手。只依据下面提供的事实写作，不要补充事实中不存在的内容。",
+        "不要读取文件、不要调用任何工具、不要检索记忆，直接输出文字。",
+        "",
+        "事实怎么读：",
+        "- 「过程」是用户原话与助手当场回答的配对；「最后回复」只代表会话结尾。",
+        "- 完成度以 git 提交、未提交改动、改动文件为准；没有代码证据的写「已讨论，尚未落地」。",
+        "- 「反复编辑」「工具报错」是卡点的证据，没有证据就不写卡点。",
+        "",
+        text,
+      ].join("\n");
+    }
+  }
+  if (!text) text = PROMPTS.daily;
+  // 模板里可能没有占位符；替换是幂等的
+  return String(text).replace(/<日期>/g, rangeLabel(r)).replace(/<日期起>/g, r.from).replace(/<日期止>/g, r.to);
+}
+
+/** 校验并规整自定义口吻列表：id 只能是半角小写字母数字，不能占用内置 id。
+ *  名称和模板允许暂时为空（用户正在编辑），渲染时各自有兜底。 */
+function sanitizeCustomTones(list) {
+  const out = [];
+  const seen = new Set(Object.keys(BUILTIN_TONE_LABELS));
+  for (const raw of Array.isArray(list) ? list : []) {
+    if (!raw || typeof raw !== "object") continue;
+    const id = String(raw.id || "").trim();
+    if (!TONE_ID_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id: id,
+      label: String(raw.label || "").trim().slice(0, 24),
+      prompt: String(raw.prompt || "").slice(0, 8000),
+    });
+    if (out.length >= MAX_CUSTOM_TONES) break;
+  }
+  return out;
+}
+
+/** 把报告文件按「范围 + 口吻」拆开；不合规的文件名返回 null。 */
+function parseReportName(name) {
+  const base = String(name || "").replace(/^.*[\\/]/, "");
+  if (!base.endsWith(".md")) return null;
+  const stem = base.slice(0, -3);
+  // <from>-<mode> 或 <from>_<to>-<mode>
+  const m = /^(\d{4}-\d{2}-\d{2})(?:_(\d{4}-\d{2}-\d{2}))?-([a-z][a-z0-9]{0,15})$/.exec(stem);
+  if (!m) return null;
+  return { from: m[1], to: m[2] || m[1], mode: m[3] };
+}
+
+/** 读取 reports/ 下的报告清单，按结束日倒序（同日再按开始日倒序）。
+ *  只有文件不多时才逐个读大小；报告多了光靠文件名就够了，别为了一个数字读上百个文件。 */
+let reportListSeq = 0;
+async function loadReportList() {
+  if (!appCtx) return;
+  const seq = ++reportListSeq;
+  set({ reportListLoading: true });
+  try {
+    const list = await appCtx.documentStorage.list(REPORTS_DIR + "/");
+    const metas = [];
+    for (const item of list || []) {
+      const rel = String(item || "");
+      if (!rel.endsWith(".md")) continue;
+      const meta = parseReportName(rel);
+      if (!meta) continue;
+      metas.push(Object.assign({ rel: withDir(REPORTS_DIR, rel), key: rangeKey(meta) }, meta));
+    }
+    metas.sort((a, b) => {
+      if (a.to !== b.to) return b.to.localeCompare(a.to);
+      return b.from.localeCompare(a.from);
+    });
+    const rows = metas.slice(0, MAX_REPORT_LIST_READ);
+    for (const row of rows) {
+      try {
+        const doc = await appCtx.documentStorage.readText(row.rel);
+        if (doc && typeof doc.content === "string") row.size = doc.content.length;
+      } catch (e) {
+        /* 单个文件读不了不影响列表 */
+      }
+    }
+    set({ reportList: metas });
+  } catch (e) {
+    if (seq === reportListSeq) set({ reportList: [] });
+  } finally {
+    if (seq === reportListSeq) set({ reportListLoading: false });
+  }
 }
 
 /* ------------------------------------------------------------ 事实摘要文本 */
@@ -1610,16 +2000,17 @@ async function generateReport() {
   if (store.snap.generating) return;
   const facts = visibleFacts(store.snap.facts, store.snap.mutedWorkspaces);
   if (!facts) {
-    set({ error: "请先扫描当天的会话，再生成报告。" });
+    set({ error: "请先扫描这些天的会话，再生成报告。" });
     return;
   }
   if (!facts.totals.sessions) {
-    set({ error: "这一天没有被纳入统计的工作区，先在设置里恢复一个。" });
+    set({ error: "这个范围里没有被纳入统计的工作区，先扫描或恢复一个工作区。" });
     return;
   }
 
   const seq = ++genSeq;
-  const targetDate = store.snap.date;
+  const targetRange = normalizeRange(store.snap.range);
+  const targetKey = rangeKey(targetRange);
   const targetMode = store.snap.reportMode;
   const ctrl = new AbortController();
   activeAbort = ctrl;
@@ -1655,9 +2046,7 @@ async function generateReport() {
     const model = preferModel || (models[0] ? models[0].id : undefined);
 
     const digest = buildFactsDigest(facts, store.snap.git);
-    const prompt =
-      PROMPTS[targetMode].replace(/<日期>/g, facts.range.from) +
-      "\n\n===== 事实 =====\n" + digest;
+    const prompt = promptFor(targetMode, targetRange) + "\n\n===== 事实 =====\n" + digest;
 
     const text = await runAgent(
       prompt,
@@ -1676,7 +2065,8 @@ async function generateReport() {
     if (!text) throw new Error("模型没有返回文本。");
 
     // 生成结果只放进编辑区，不自动落盘：点「保存」才写文件
-    const sameView = store.snap.date === targetDate && store.snap.reportMode === targetMode;
+    const sameView =
+      rangeKey(store.snap.range) === targetKey && store.snap.reportMode === targetMode;
     set({ generating: false, streamText: "", runId: "" });
     if (sameView) set({ report: text });
     flash("报告已生成，点「保存」写入文件");
@@ -1766,30 +2156,73 @@ async function copyReport() {
   }
 }
 
-async function changeDate(date) {
-  if (!date || date === store.snap.date) return;
+/** 切换扫描范围。preset 只是界面上的选中态，不影响读写哪个报告文件。 */
+async function changeRange(next, preset) {
+  const range = normalizeRange(next);
+  const key = rangeKey(range);
+  const pick = preset || store.snap.rangePreset;
+  if (key === rangeKey(store.snap.range) && pick === store.snap.rangePreset) return;
   stashReportDraft();
   reportSwitchSeq += 1;
   const seq = reportSwitchSeq;
   const mode = store.snap.reportMode;
-  const key = REPORT_KEY(date, mode);
-  // 先展示已缓存的内容（若有未保存草稿就是草稿），读盘后再校正
-  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
-  const next = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
-  set({
-    date: date,
+  const rkey = REPORT_KEY(range, mode);
+  // 先展示缓存内容（有未保存草稿就是草稿），读盘后再校正
+  const savedNow = reportDiskText.has(rkey) ? reportDiskText.get(rkey) : "";
+  const cached = reportDraftText.has(rkey) ? reportDraftText.get(rkey) : savedNow;
+  const patch = {
+    range: range,
+    rangePreset: pick,
     facts: null,
     git: null,
-    report: next,
+    report: cached,
     reportSaved: savedNow,
     streamText: "",
     error: "",
     mutedWorkspaces: [],
-  });
-  const text = await loadReportIntoCache(date, mode);
-  // 加载期间用户又换了日期或口吻
+  };
+  if (pick === "custom") patch.rangeDraft = range;
+  set(patch);
+  const text = await loadReportIntoCache(range, mode);
+  // 加载期间用户又换了范围或口吻
   if (seq !== reportSwitchSeq) return;
-  if (store.snap.date === date && store.snap.reportMode === mode) showReport(date, mode, text);
+  if (rangeKey(store.snap.range) === key && store.snap.reportMode === mode) {
+    showReport(range, mode, text);
+  }
+}
+
+/** 预设按钮：单日 = 今天，本周 = 本周一至今天，自定义 = 保留当前范围并展开两个日期框。 */
+function applyPreset(preset) {
+  const today = todayStr();
+  if (preset === "day") {
+    void changeRange({ from: today, to: today }, "day");
+    return;
+  }
+  if (preset === "week") {
+    void changeRange({ from: weekStart(today), to: today }, "week");
+    return;
+  }
+  // 切到自定义不改变范围，只是把两个输入框露出来
+  const cur = normalizeRange(store.snap.range);
+  set({ rangePreset: "custom", rangeDraft: cur });
+}
+
+/** 自定义范围的两个输入框：改一端时把另一端顶到合法位置，避免输入到一半就交换。 */
+function changeRangeDraft(which, value) {
+  const draft = Object.assign({}, store.snap.rangeDraft);
+  draft[which] = value;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) {
+    set({ rangeDraft: draft });
+    return;
+  }
+  // 用户把起点拖到终点之后：终点跟着走，而不是互换两端的值
+  if (draft.from && draft.to) {
+    if (which === "from" && draft.from > draft.to) draft.to = draft.from;
+    if (which === "to" && draft.to < draft.from) draft.from = draft.to;
+  }
+  const range = normalizeRange(draft);
+  set({ rangeDraft: range });
+  void changeRange(range, "custom");
 }
 
 function openSettings() {
@@ -1984,6 +2417,7 @@ function GitBlock(props) {
   }
   const commits = g.commits || [];
   const dirty = g.dirty || [];
+  const cross = props.cross;
   return h(
     "div",
     { className: "wl-git" },
@@ -2012,6 +2446,49 @@ function GitBlock(props) {
           ),
           dirty.length > 8 ? h("span", { className: "wl-dirty-item" }, "…") : null
         )
+      : null,
+    cross && cross.edited
+      ? h(
+          "div",
+          { className: "wl-cross" },
+          h(
+            "div",
+            { className: "wl-cross-line" },
+            "会话改了 " + cross.edited + " 个文件",
+            cross.pendingCount
+              ? "，其中 " + cross.pendingCount + " 个仍是未提交改动"
+              : "，git 里都没有未提交改动",
+            cross.settledCount
+              ? "；另有 " + cross.settledCount + " 个在 git 状态里看不到，可能已提交或被还原"
+              : "",
+            "。"
+          ),
+          cross.pending.length
+            ? h(
+                "div",
+                { className: "wl-cross-line" },
+                "仍未提交：" + cross.pending.map(shortPath).join("、") +
+                  (cross.pendingCount > cross.pending.length ? " …" : "")
+              )
+            : null,
+          cross.settled.length
+            ? h(
+                "div",
+                { className: "wl-cross-line is-warn" },
+                "对不上（会话改过、git 无未提交）：" + cross.settled.map(shortPath).join("、") +
+                  (cross.settledCount > cross.settled.length ? " …" : "")
+              )
+            : null,
+          cross.gitOnlyCount
+            ? h(
+                "div",
+                { className: "wl-cross-line is-muted" },
+                "git 有、这段范围没碰过 " + cross.gitOnlyCount + " 个：" +
+                  cross.gitOnly.map(shortPath).join("、") +
+                  (cross.gitOnlyCount > cross.gitOnly.length ? " …" : "")
+              )
+            : null
+        )
       : null
   );
 }
@@ -2022,6 +2499,7 @@ function WorkspaceCard(props) {
   const sessions = group.sessions.map((id) => byId.get(id)).filter(Boolean);
   const git = findGit(group.workspace);
   const commitCount = git && git.commits ? git.commits.length : 0;
+  const cross = git && git.isRepo ? crossCheck(group.workspace, sessions, git) : null;
 
   return h(
     "details",
@@ -2058,7 +2536,7 @@ function WorkspaceCard(props) {
       )
     ),
     sessions.map((s) => h(SessionBlock, { key: s.sessionId, session: s })),
-    h(GitBlock, { git: git })
+    h(GitBlock, { git: git, cross: cross })
   );
 }
 
@@ -2112,8 +2590,8 @@ function FactsView(props) {
     return h(
       "div",
       { className: "wl-empty" },
-      h("b", null, "这一天没有会话记录"),
-      "换个日期，或在设置里检查会话根目录。"
+      h("b", null, rangeLabel(snap.range) + " 没有会话记录"),
+      "换个日期范围，或在设置里检查会话根目录。"
     );
   }
 
@@ -2130,8 +2608,7 @@ function FactsView(props) {
       { className: "wl-sub" },
       "来源核对：" + facts.totals.filesScanned + " 个会话文件 · " +
       facts.totals.sessions + " 个会话 · " +
-      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +
-      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
+      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
       (snap.rechecking ? " · 正在核对 git…" : "")
     ),
     mutedNames.length
@@ -2158,10 +2635,23 @@ function FactsView(props) {
 
 /* ---------------------------------------------------------------- Markdown 预览 */
 
-/** 行内标记：粗体、行内代码、http(s) 链接。不用 innerHTML，避免把报告内容当 HTML 执行。 */
+/** 会话短 ID（sessionId 前 8 位，界面与报告里都用它）→ 会话对象。 */
+function sessionIndex() {
+  const facts = visibleFacts(store.snap.facts, store.snap.mutedWorkspaces);
+  const map = new Map();
+  if (!facts || !Array.isArray(facts.sessions)) return map;
+  for (const s of facts.sessions) {
+    const id = String(s.sessionId || "");
+    if (id.length >= 8) map.set(id.slice(0, 8).toLowerCase(), s);
+  }
+  return map;
+}
+
+/** 行内标记：粗体、行内代码、http(s) 链接、会话短 ID。不用 innerHTML，避免把报告内容当 HTML 执行。 */
 function markdownInline(text, keyBase) {
   const nodes = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+  const sessions = sessionIndex();
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|\b[0-9a-f]{8}\b)/g;
   let last = 0;
   let n = 0;
   let m;
@@ -2173,7 +2663,7 @@ function markdownInline(text, keyBase) {
       nodes.push(h("strong", { key: key }, tok.slice(2, -2)));
     } else if (tok.startsWith("`")) {
       nodes.push(h("code", { key: key, className: "wl-md-code" }, tok.slice(1, -1)));
-    } else {
+    } else if (tok.startsWith("[")) {
       const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
       if (link && /^https?:\/\//i.test(link[2])) {
         nodes.push(
@@ -2182,6 +2672,24 @@ function markdownInline(text, keyBase) {
       } else {
         nodes.push(tok);
       }
+    } else if (sessions.has(tok)) {
+      // 报告里引用的会话短 ID：点一下直接打开那个会话
+      const s = sessions.get(tok);
+      nodes.push(
+        h(
+          "button",
+          {
+            key: key,
+            type: "button",
+            className: "wl-md-session",
+            title: "打开会话 " + shortPath(s.workspace || "") + "（" + tok + "）",
+            onClick: () => void openSession(s),
+          },
+          tok
+        )
+      );
+    } else {
+      nodes.push(tok);
     }
     last = m.index + tok.length;
     n += 1;
@@ -2391,15 +2899,15 @@ function ReportPanel() {
   const viewMode = viewState[0];
   const setViewMode = viewState[1];
 
-  // 切换日期或口吻后，上一份报告的保存状态不该跟过来
-  const reportViewKey = snap.date + "|" + snap.reportMode;
+  // 切换范围或口吻后，上一份报告的保存状态不该跟过来
+  const reportViewKey = rangeKey(snap.range) + "|" + snap.reportMode;
   const seenView = R.useRef(reportViewKey);
   if (seenView.current !== reportViewKey) {
     seenView.current = reportViewKey;
     if (saveStatus) setSaveStatus("");
   }
 
-  // 生成完成、切换日期/口吻等外部变化时，用 store 的值覆盖草稿
+  // 生成完成、切换范围/口吻等外部变化时，用 store 的值覆盖草稿
   if (seen.current !== snap.report) {
     seen.current = snap.report;
     // 生成完成或切换内容后，上一份报告的「已保存 / 保存失败」不再适用
@@ -2415,11 +2923,13 @@ function ReportPanel() {
     }
   };
 
-  const modeLabel = snap.reportMode === "retro" ? "复盘" : "日报";
+  const tones = allTones();
+  const currentTone = tones.find((t) => t.id === snap.reportMode);
+  const modeShort = currentTone ? currentTone.short : "日报";
   const hasReport = !!draft.trim();
   // draft 与 reportSaved 不等说明有改动还没点保存
   const dirty = hasReport && draft !== snap.reportSaved;
-  const reportFile = reportRel(snap.date, snap.reportMode);
+  const reportFile = reportRel(snap.range, snap.reportMode);
   const storeDir = snap.storage && snap.storage.path ? snap.storage.path : "";
   const reportAbs = joinDisplayPath(storeDir, reportFile);
   const factsNow = visibleFacts(snap.facts, snap.mutedWorkspaces);
@@ -2431,14 +2941,16 @@ function ReportPanel() {
     // 先把编辑区交回 store：保存期间用户继续输入，不会被回滚
     commit();
     const text = draft;
-    const targetDate = store.snap.date;
+    const targetRange = normalizeRange(store.snap.range);
+    const targetKey = rangeKey(targetRange);
     const targetMode = store.snap.reportMode;
     const targetAbs = reportAbs;
     setSaveStatus("saving");
     void (async () => {
-      const sameView = () => store.snap.date === targetDate && store.snap.reportMode === targetMode;
+      const sameView = () =>
+        rangeKey(store.snap.range) === targetKey && store.snap.reportMode === targetMode;
       try {
-        await saveReportText(targetDate, targetMode, text);
+        await saveReportText(targetRange, targetMode, text);
         // 期间切了日期/口吻：磁盘缓存已由 saveReportText 更新，不要再动当前视图
         if (!sameView()) return;
         // 只更新「已保存到哪一版」：report 可能已经被用户继续编辑过，不能整体覆盖
@@ -2460,6 +2972,7 @@ function ReportPanel() {
       "div",
       { className: "wl-report-head" },
       h("h2", null, "报告"),
+      h("span", { className: "wl-report-range", title: rangeLabel(snap.range) }, rangeLabel(snap.range)),
       h("span", { className: "wl-spacer" }),
       h(
         "div",
@@ -2485,26 +2998,21 @@ function ReportPanel() {
       ),
       h(
         "div",
-        { className: "wl-seg" },
-        h(
-          "button",
-          {
-            className: snap.reportMode === "daily" ? "on" : "",
-            disabled: snap.generating,
-            title: snap.generating ? "生成完成后才能切换口吻" : "切换到工作日报",
-            onClick: () => void switchReportMode("daily"),
-          },
-          "日报"
-        ),
-        h(
-          "button",
-          {
-            className: snap.reportMode === "retro" ? "on" : "",
-            disabled: snap.generating,
-            title: snap.generating ? "生成完成后才能切换口吻" : "切换到个人复盘",
-            onClick: () => void switchReportMode("retro"),
-          },
-          "复盘"
+        { className: "wl-seg wl-seg-tones" },
+        tones.map((t) =>
+          h(
+            "button",
+            {
+              key: t.id,
+              className: snap.reportMode === t.id ? "on" : "",
+              disabled: snap.generating,
+              title: snap.generating
+                ? "生成完成后才能切换口吻"
+                : "切换到" + t.label + (t.builtin ? "" : "（自定义）"),
+              onClick: () => void switchReportMode(t.id),
+            },
+            t.short
+          )
         )
       )
     ),
@@ -2516,7 +3024,7 @@ function ReportPanel() {
         : h(
             "button",
             { className: "wl-btn primary block", disabled: !canGenerate, onClick: () => void generateReport() },
-            "生成" + modeLabel
+            "生成" + modeShort
           )
     ),
     h(
@@ -2538,7 +3046,7 @@ function ReportPanel() {
       ? h("div", { className: "wl-stream" }, snap.streamText || "正在等待模型返回…")
       : null,
     !snap.generating && !hasReport
-      ? h("p", { className: "wl-report-state" }, "扫描后点「生成" + modeLabel + "」，模型只依据上面的事实写作。")
+      ? h("p", { className: "wl-report-state" }, "扫描后点「生成" + modeShort + "」，模型只依据上面的事实写作。")
       : null,
     !snap.generating && hasReport
       ? viewMode === "preview"
@@ -2588,15 +3096,18 @@ function ReportPanel() {
 
 function headSub(snap, facts) {
   if (snap.scanning) return "正在读取会话记录…";
-  if (!facts) return "按天汇总 Claude Code 会话与 git 改动；事实在本地生成，不消耗 token。";
+  if (!facts) {
+    return "按范围汇总 " + SCAN_ENGINE_LABEL + " 会话与 git 改动；事实在本地生成，不消耗 token。";
+  }
   const t = facts.totals;
   if (!t.sessions) {
     if (snap.facts && snap.facts.totals && snap.facts.totals.sessions > 0) {
       return "本次扫描的工作区都被你隐藏了；重新扫描或点「全部显示」即可恢复。";
     }
-    return "这一天没有会话记录。";
+    return rangeLabel(snap.range) + " 没有会话记录。";
   }
   const parts = [t.sessions + " 个会话", t.workspaces + " 个工作区"];
+  if (rangeDays(snap.range) > 1) parts.push(rangeDays(snap.range) + " 天");
   const muted = (snap.mutedWorkspaces || []).length;
   if (muted) parts.push("已隐藏 " + muted + " 个");
   if (snap.git) {
@@ -2609,6 +3120,169 @@ function headSub(snap, facts) {
   }
   parts.push("扫描于 " + (hhmm(facts.scannedAt) || "—"));
   return parts.join(" · ");
+}
+
+/** 范围预设 + 自定义的两个日期。生成中禁用，避免结果落到别的文件里。 */
+function RangePicker() {
+  const snap = useSnap();
+  const multi = rangeDays(snap.range) > 1;
+  return h(
+    "div",
+    { className: "wl-range" },
+    h(
+      "div",
+      { className: "wl-seg" },
+      PRESETS.map((p) =>
+        h(
+          "button",
+          {
+            key: p.value,
+            className: snap.rangePreset === p.value ? "on" : "",
+            disabled: snap.generating,
+            title: snap.generating ? "生成完成后才能切换范围" : "按" + p.label + "扫描",
+            onClick: () => applyPreset(p.value),
+          },
+          p.label
+        )
+      )
+    ),
+    snap.rangePreset === "custom"
+      ? h(
+          "div",
+          { className: "wl-range-inputs" },
+          h("input", {
+            type: "date",
+            className: "wl-input",
+            value: snap.rangeDraft.from,
+            max: snap.rangeDraft.to,
+            disabled: snap.generating,
+            title: "起始日期",
+            onChange: (e) => changeRangeDraft("from", e.target.value),
+          }),
+          h("span", { className: "wl-range-sep" }, "至"),
+          h("input", {
+            type: "date",
+            className: "wl-input",
+            value: snap.rangeDraft.to,
+            min: snap.rangeDraft.from,
+            disabled: snap.generating,
+            title: "结束日期",
+            onChange: (e) => changeRangeDraft("to", e.target.value),
+          })
+        )
+      : null,
+    multi && snap.rangePreset !== "custom"
+      ? h("span", { className: "wl-range-note" }, rangeLabel(snap.range))
+      : null
+  );
+}
+
+/** 从「报告历史」点进一条：范围和口吻一起切换，只触发一次读盘。 */
+async function openReportEntry(entry) {
+  if (!entry || store.snap.generating) return;
+  const range = normalizeRange({ from: entry.from, to: entry.to });
+  const mode = String(entry.mode || "");
+  // 这份报告用的口吻可能已经被删掉了：文件还在，但没有模板可以重新生成
+  if (!allTones().some((t) => t.id === mode)) {
+    flash("这份报告的写法「" + mode + "」已经不存在了，只能查看不能重新生成");
+  }
+  stashReportDraft();
+  reportSwitchSeq += 1;
+  const seq = reportSwitchSeq;
+  const key = REPORT_KEY(range, mode);
+  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
+  const cached = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
+  set({
+    range: range,
+    rangePreset: range.from === range.to ? "day" : "custom",
+    rangeDraft: range,
+    reportMode: mode,
+    facts: null,
+    git: null,
+    report: cached,
+    reportSaved: savedNow,
+    streamText: "",
+    error: "",
+    mutedWorkspaces: [],
+  });
+  const text = await loadReportIntoCache(range, mode);
+  if (seq !== reportSwitchSeq) return;
+  if (rangeKey(store.snap.range) === rangeKey(range) && store.snap.reportMode === mode) {
+    showReport(range, mode, text);
+  }
+}
+
+/** 报告历史：点一条就切到那个范围与口吻，扫描后可直接看图。 */
+function ReportHistory() {
+  const R = appCtx.react;
+  const snap = useSnap();
+  const list = snap.reportList;
+  const openState = R.useState(false);
+  const open = openState[0];
+  const setOpen = openState[1];
+
+  const rows = Array.isArray(list) ? list : [];
+  const currentKey = rangeKey(snap.range) + "|" + snap.reportMode;
+  const busy = snap.generating;
+
+  return h(
+    "section",
+    { className: "wl-history" },
+    h(
+      "button",
+      {
+        className: "wl-history-toggle",
+        "aria-expanded": open ? "true" : "false",
+        onClick: () => {
+          setOpen(!open);
+          // 每次展开都重新读一遍：报告可能在别的窗口里被改过
+          if (!open) void loadReportList();
+        },
+      },
+      h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
+      h("b", null, "报告历史"),
+      h(
+        "span",
+        { className: "wl-muted" },
+        snap.reportListLoading
+          ? "正在读取…"
+          : list
+            ? rows.length + " 份"
+            : "点开查看已保存的报告"
+      )
+    ),
+    open
+      ? rows.length
+        ? h(
+            "ul",
+            { className: "wl-history-list" },
+            rows.map((r) =>
+              h(
+                "li",
+                {
+                  key: r.rel,
+                  className: currentKey === r.key + "|" + r.mode ? "is-current" : "",
+                },
+                h(
+                  "button",
+                  {
+                    className: "wl-history-row",
+                    disabled: busy,
+                    title: busy ? "生成完成后才能切换" : "打开 " + r.rel,
+                    onClick: () => void openReportEntry(r),
+                  },
+                  h("span", { className: "wl-history-date" }, r.from === r.to ? r.from : r.from + " 至 " + r.to),
+                  h("span", { className: "wl-history-tone" }, toneLabel(r.mode)),
+                  typeof r.size === "number" && r.size > 0
+                    ? h("span", { className: "wl-history-size" }, fmtNum(r.size) + " 字符")
+                    : null
+                )
+              )
+            )
+          )
+        : h("p", { className: "wl-history-empty" }, "还没有保存过报告。生成后点「保存」就会出现在这里。")
+      : null
+  );
 }
 
 function CenterTab() {
@@ -2633,24 +3307,17 @@ function CenterTab() {
           { className: "wl-head-row" },
           h("h1", { className: "wl-title" }, "工作志"),
           h("span", { className: "wl-spacer" }),
-          h("input", {
-            type: "date",
-            className: "wl-input",
-            value: snap.date,
-            disabled: snap.generating,
-            title: snap.generating ? "生成完成后才能切换日期" : "",
-            onChange: (e) => void changeDate(e.target.value),
-          }),
+          h(RangePicker),
           h(
             "button",
             {
               className: "wl-btn",
-              disabled: snap.scanning || snap.rechecking,
+              disabled: snap.scanning || snap.rechecking || snap.generating,
               onClick: () => void doScan(),
             },
             snap.scanning
               ? h("span", { className: "wl-btn-inner" }, h("span", { className: "wl-spinner" }), "扫描中…")
-              : "扫描当天"
+              : "扫描"
           ),
           h("button", { className: "wl-btn ghost", onClick: () => openSettings() }, "设置")
         ),
@@ -2658,6 +3325,7 @@ function CenterTab() {
       ),
       snap.error ? h("div", { className: "wl-error" }, snap.error) : null,
       snap.toast ? h("div", { className: "wl-toast" }, snap.toast) : null,
+      h(ReportHistory),
       facts ? h(StatsStrip, { facts: facts }) : null,
       h(
         "div",
@@ -2671,7 +3339,7 @@ function CenterTab() {
                 "div",
                 { className: "wl-empty" },
                 h("b", null, "还没有扫描"),
-                "点「扫描当天」读取这一天的会话记录；整个过程只读本地文件，不消耗 token。"
+                "选好日期范围后点「扫描」，读取这段时间的会话记录；整个过程只读本地文件，不消耗 token。"
               )
         ),
         h(ReportPanel)
@@ -3028,6 +3696,105 @@ function SettingsSection() {
     );
 
   const engines = (snap.catalog || []).filter((e) => e && typeof e.engine === "string");
+  const customTones = Array.isArray(form.customTones) ? form.customTones : [];
+  const toneItems = allTones(customTones).map((t) => ({
+    value: t.id,
+    label: t.label + (t.builtin ? "" : "（自定义）"),
+  }));
+  // 当前默认口吻的自定义项被删掉时，下拉回落到日报，避免留下空选项
+  if (!toneItems.some((t) => t.value === form.tone)) toneItems.unshift({ value: "daily", label: "工作日报" });
+
+  // 自定义口吻编辑器：id 只用来命名报告文件，界面上不展示
+  const addCustomTone = () => {
+    if (customTones.length >= MAX_CUSTOM_TONES) {
+      flash("最多只能有 " + MAX_CUSTOM_TONES + " 个自定义口吻");
+      return;
+    }
+    let n = 1;
+    while (customTones.some((t) => t.id === "t" + n)) n += 1;
+    patch(
+      "customTones",
+      customTones.concat({
+        id: "t" + n,
+        label: "自定义口吻 " + n,
+        prompt: [
+          "你是一位替工程师写工作记录的助手。只依据下面提供的事实写作，不要补充事实中不存在的内容。",
+          "不要读取文件、不要调用任何工具、不要检索记忆，直接输出文字。",
+          "",
+          "写作要求：",
+          "1. 按工作区组织，写清楚做了什么、做到什么程度。",
+          "2. 事实里没有的结论不要写。",
+          "3. 输出 Markdown，不要用代码块包裹整篇。",
+          "",
+          "结构：",
+          "# <日期> 工作记录",
+          "## 做了什么",
+          "## 结果与证据",
+        ].join("\n"),
+      })
+    );
+  };
+
+  const patchTone = (idx, key, value) => {
+    const next = customTones.map((t, i) => (i === idx ? Object.assign({}, t, { [key]: value }) : t));
+    patch("customTones", next);
+  };
+
+  const removeTone = (idx) => {
+    const gone = customTones[idx];
+    patch("customTones", customTones.filter((_, i) => i !== idx));
+    // 默认口吻跟着被删掉时回到日报
+    if (gone && form.tone === gone.id) patch("tone", "daily");
+    // 当前正在看这个口吻时切回日报
+    if (gone && store.snap.reportMode === gone.id) void switchReportMode("daily");
+  };
+
+  const toneEditor = h(
+    "div",
+    { className: "wl-tones" },
+    customTones.length
+      ? customTones.map((t, i) =>
+          h(
+            "div",
+            { className: "wl-tone-row", key: t.id },
+            h("input", {
+              className: "wl-input wl-tone-name",
+              value: t.label || "",
+              maxLength: 24,
+              placeholder: "口吻名称，例如：周会发言稿",
+              onChange: (e) => patchTone(i, "label", e.target.value),
+            }),
+            h("button", {
+              type: "button",
+              className: "wl-btn ghost",
+              title: "删除这个口吻（已保存的报告文件不会删除）",
+              onClick: () => removeTone(i),
+            }, "删除"),
+            h("textarea", {
+              className: "wl-textarea wl-tone-prompt",
+              value: t.prompt || "",
+              spellCheck: false,
+              placeholder: "给模型的写作要求。用 <日期> 代表当前范围。",
+              onChange: (e) => patchTone(i, "prompt", e.target.value),
+            })
+          )
+        )
+      : h("span", { className: "wl-path-value is-empty" }, "还没有自定义口吻"),
+    h(
+      "div",
+      { className: "wl-path-row" },
+      h(
+        "button",
+        {
+          type: "button",
+          className: "wl-btn",
+          disabled: customTones.length >= MAX_CUSTOM_TONES,
+          onClick: addCustomTone,
+        },
+        "新增口吻…"
+      )
+    )
+  );
   const engineEntry = engines.find((e) => e.engine === form.engine) || null;
   const models = engineEntry
     ? (engineEntry.models || []).filter((m) => m && typeof m.id === "string")
@@ -3159,15 +3926,22 @@ function SettingsSection() {
         "div",
         { className: "wl-section-label" },
         h("h2", null, "数据来源"),
-        h("p", null, "Claude Code 的会话日志位置。插件只读，不写源文件。")
+        h("p", null, "目前只支持 Claude Code 的会话日志；其它 CLI 的日志格式还没有适配。")
       ),
       h(
         "div",
         { className: "wl-section-panel" },
+        h(
+          "p",
+          { className: "wl-note-line" },
+          "插件只读取 Claude Code 的 ",
+          h("code", null, "~/.claude/projects"),
+          " 下的 JSONL 会话；Codex、Qoder、Kimi 等其它引擎的会话暂时不会被统计。写报告用哪个引擎在下面单独选择，两者互不影响。"
+        ),
         field(
           "会话根目录",
           pathField("sessionRoot", "默认：" + displayPath("~/.claude/projects"), resetButton("sessionRoot")),
-          "扫描时只读取这一天的 JSONL 消息，不改动源文件；旧快照 30 天后自动清理。只能通过系统选择器指定。"
+          "扫描时只读取这段范围里的 JSONL 消息，不改动源文件；旧快照 30 天后自动清理。只能通过系统选择器指定。"
         ),
         field(
           "报告保存目录",
@@ -3219,11 +3993,13 @@ function SettingsSection() {
         ),
         field(
           "打开时默认的口吻",
-          dropdown("tone", [
-            { value: "daily", label: "工作日报" },
-            { value: "retro", label: "个人复盘" },
-          ]),
+          dropdown("tone", toneItems),
           "报告面板打开时默认用哪一种写法。"
+        ),
+        field(
+          "自定义口吻",
+          toneEditor,
+          "最多 " + MAX_CUSTOM_TONES + " 个。模板里可用 <日期> 代表当前范围；内置的三种写法不受这里影响。"
         )
       )
     ),
@@ -3320,12 +4096,17 @@ function SettingsSection() {
 async function bootstrap() {
   const settings = await readSettings();
   if (!appCtx) return;
-  const mode = settings.tone === "retro" ? "retro" : "daily";
-  set({ settings: settings, ready: true, reportMode: mode });
+  // 口吻可能是自定义的：只认得出来的那个，认不出就回到日报
+  const tones = Object.keys(BUILTIN_TONE_LABELS).concat(
+    (settings.customTones || []).map((t) => t.id)
+  );
+  const mode = tones.includes(settings.tone) ? settings.tone : "daily";
+  set({ settings: settings, customTones: settings.customTones || [], ready: true, reportMode: mode });
   void loadCatalog();
   void refreshStorageLocation();
   void cleanupReportBaks();
-  const saved = await loadReportIntoCache(store.snap.date, mode);
+  void loadReportList();
+  const saved = await loadReportIntoCache(store.snap.range, mode);
   if (saved) set({ report: saved, reportSaved: saved });
 }
 

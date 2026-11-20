@@ -357,3 +357,32 @@ test("扫描：指定目录不存在时明确失败", () => {
   assert.notEqual(err.status, 0);
   assert.match(String(err.stderr || ""), /会话根目录不存在/);
 });
+
+test("扫描：显式 --engine claude 走 Claude Code 适配器", () => {
+  const { dir } = makeFixture();
+  const out = execFileSync(process.execPath, [SCAN, "--root", dir, "--date", DATE, "--engine", "claude"], {
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  const r = JSON.parse(out);
+  assert.equal(r.engine, "claude");
+  assert.equal(r.engineLabel, "Claude Code");
+  assert.deepEqual(r.supportedEngines, ["claude"]);
+  assert.equal(r.totals.sessions, 1);
+});
+
+test("扫描：指定未知引擎时明确失败，不按 Claude 格式硬解析", () => {
+  const { dir } = makeFixture();
+  let err = null;
+  try {
+    execFileSync(process.execPath, [SCAN, "--root", dir, "--date", DATE, "--engine", "codex"], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err, "应非零退出");
+  assert.notEqual(err.status, 0);
+  assert.match(String(err.stderr || ""), /不支持引擎 codex/);
+});

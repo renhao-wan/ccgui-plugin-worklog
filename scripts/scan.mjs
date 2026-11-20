@@ -151,10 +151,44 @@ function clip(text, max) {
   return text.slice(0, head) + "…" + text.slice(-tail);
 }
 
-async function scanSessionFile(file, windowStart, windowEnd) {
+/* ------------------------------------------------------------ 引擎适配器
+ * 扫描器只认识一种会话日志格式：Claude Code 的 JSONL。其它引擎（Codex、
+ * Qoder、Kimi…）的字段名与目录布局都不同，没有真实样本前不臆造解析。
+ * 这里把「读一行原始对象 → 规范字段」集中成适配器，后续接入新引擎时
+ * 只需要新增一个条目，扫描主流程不用改。
+ */
+const ADAPTERS = {
+  claude: {
+    id: "claude",
+    label: "Claude Code",
+    /** 规范形状：{ ts, sessionId, workspace, branch, cliVersion, sidechain, kind, content } */
+    readLine(o) {
+      if (!o || typeof o !== "object") return null;
+      const kind = o.type === "user" || o.type === "assistant" ? o.type : "";
+      return {
+        ts: typeof o.timestamp === "string" ? o.timestamp : null,
+        sessionId: o.sessionId ? String(o.sessionId) : null,
+        workspace: o.cwd ? String(o.cwd) : "",
+        branch: o.gitBranch ? String(o.gitBranch) : null,
+        cliVersion: o.version ? String(o.version) : null,
+        sidechain: o.isSidechain === true,
+        kind: kind,
+        content: messageContent(o.message),
+      };
+    },
+  },
+};
+
+function resolveAdapter(name) {
+  const key = String(name || "").trim().toLowerCase();
+  if (!key || key === "auto") return ADAPTERS.claude;
+  return ADAPTERS[key] || null;
+}
+
+async function scanSessionFile(file, windowStart, windowEnd, adapter) {
   const s = {
     sessionId: null,
-    engine: "claude",
+    engine: adapter.id,
     workspace: "",
     gitBranch: null,
     cliVersion: null,
@@ -199,20 +233,22 @@ async function scanSessionFile(file, windowStart, windowEnd) {
       continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件
     }
 
-    if (o.sessionId && !s.sessionId) s.sessionId = o.sessionId;
-    if (o.cwd && !s.workspace) s.workspace = o.cwd;
-    if (o.gitBranch && !s.gitBranch) s.gitBranch = o.gitBranch;
-    if (o.version && !s.cliVersion) s.cliVersion = o.version;
+    const rec = adapter.readLine(o);
+    if (!rec) continue;
+    if (rec.sessionId && !s.sessionId) s.sessionId = rec.sessionId;
+    if (rec.workspace && !s.workspace) s.workspace = rec.workspace;
+    if (rec.branch && !s.gitBranch) s.gitBranch = rec.branch;
+    if (rec.cliVersion && !s.cliVersion) s.cliVersion = rec.cliVersion;
 
-    const tsRaw = o.timestamp;
+    const tsRaw = rec.ts;
     const ts = typeof tsRaw === "string" ? Date.parse(tsRaw) : NaN;
     if (!Number.isFinite(ts)) continue;
 
     if (ts < windowStart) {
       sawAnyMessageBeforeWindow = true;
       // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对
-      if (o.type === "user" && !o.isSidechain) {
-        const early = messageContent(o.message);
+      if (rec.kind === "user" && !rec.sidechain) {
+        const early = rec.content;
         if (early && !isToolResult(early)) {
           const text = textBlocks(early).join("\n").trim();
           if (text && !isInternalText(text)) {
@@ -228,18 +264,17 @@ async function scanSessionFile(file, windowStart, windowEnd) {
     }
     if (ts >= windowEnd) continue;
 
-    const msg = o.message;
     // content 可能是块数组，也可能是字符串：CLI 的内部注入、
     // 部分续接消息与简单用户输入都会以纯字符串落盘。
-    const content = messageContent(msg);
+    const content = rec.content;
     if (content === null) continue;
 
-    if (o.isSidechain) {
+    if (rec.sidechain) {
       s.sidechainTurns++;
       continue;
     }
 
-    if (o.type === "user") {
+    if (rec.kind === "user") {
 
       // 工具错误：tool_result 块上的 is_error
       for (const b of content) {
@@ -275,7 +310,7 @@ async function scanSessionFile(file, windowStart, windowEnd) {
       continue;
     }
 
-    if (o.type === "assistant") {
+    if (rec.kind === "assistant") {
       sawAnyMessageInWindow = true;
       s.assistantTurns++;
       if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;
@@ -374,6 +409,14 @@ function groupByWorkspace(sessions) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  // 目前只实现 Claude Code 的适配器；显式指定未知引擎时明确失败，
+  // 而不是悄悄按 Claude 的格式解析出一堆空会话。
+  const adapter = resolveAdapter(args.engine);
+  if (!adapter) {
+    throw new Error(
+      "不支持引擎 " + args.engine + "；目前只能解析 Claude Code 的会话日志（--engine claude）"
+    );
+  }
   // --root auto（或缺省）= Claude Code 的默认会话目录
   const root = !args.root || args.root === "auto" ? path.join(os.homedir(), ".claude", "projects") : args.root;
   if (!root) throw new Error("缺少 --root <会话根目录>");
@@ -395,7 +438,7 @@ async function main() {
   const failed = [];
   for (const f of files) {
     try {
-      const s = await scanSessionFile(f, windowStart, windowEnd);
+      const s = await scanSessionFile(f, windowStart, windowEnd, adapter);
       if (s) sessions.push(s);
     } catch (e) {
       failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });
@@ -418,6 +461,9 @@ async function main() {
 
   const payload = {
     schema: "worklog.facts.v1",
+    engine: adapter.id,
+    engineLabel: adapter.label,
+    supportedEngines: Object.keys(ADAPTERS),
     scannedAt: new Date().toISOString(),
     range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
     root,

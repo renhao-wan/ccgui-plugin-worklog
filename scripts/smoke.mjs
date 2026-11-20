@@ -36,9 +36,12 @@ function makeFixture() {
   git(["init"]);
   git(["add", "."]);
   git(["-c", "user.name=Smoke", "-c", "user.email=smoke@example.com", "commit", "-m", "feat: 登录校验第一版"]);
+  // 提交后再改一次，制造一个「会话改过、仍未提交」的文件，用于交叉对账
+  fs.writeFileSync(path.join(repoDir, "login.js"), "export const ok = false;\n");
 
+  // 真实 Claude Code 的 sessionId 是 UUID，报告引用它时会显示前 8 位十六进制
   const base = {
-    sessionId: "smoke-sess-1",
+    sessionId: "a1b2c3d4-1111-2222-3333-444455556666",
     cwd: repoDir,
     gitBranch: "main",
     version: "2.1.0",
@@ -76,7 +79,7 @@ function makeFixture() {
     },
   ];
   fs.writeFileSync(
-    path.join(sessionRoot, "smoke-sess-1.jsonl"),
+    path.join(sessionRoot, "a1b2c3d4.jsonl"),
     rows.map((r) => JSON.stringify(r)).join("\n"),
     "utf8"
   );
@@ -380,7 +383,7 @@ const ctx = {
       setTimeout(() => {
         if (idx === 1) {
           emit({ runId, kind: "delta", data: "# " + DATE + " 工作日报\n" });
-          emit({ runId, kind: "delta", data: "## 今日完成\n- 修复登录校验（smoke-sess）\n" });
+          emit({ runId, kind: "delta", data: "## 今日完成\n- 修复登录校验（a1b2c3d4）\n" });
         } else {
           emit({ runId, kind: "delta", data: "# SECOND-RUN-MARKER\n## 今日完成\n- 这一轮会被停止\n" });
         }
@@ -473,7 +476,7 @@ check("启动时清理遗留的 .bak", () => {
 });
 
 let tree = renderFresh(tabDef.component);
-const scanButton = findByText(tree, "扫描当天");
+const scanButton = findByText(tree, "扫描");
 check("页面初始为空态并给出说明", () => {
   assert.ok(scanButton, "应有扫描按钮");
   assert.match(textOf(tree), /还没有扫描/);
@@ -500,6 +503,13 @@ check("git 对账读到了当天的提交", () => {
   assert.match(t, /登录校验第一版/);
 });
 
+check("交叉对账把会话改动和 git 状态对上", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.match(t, /会话改了 1 个文件/);
+  assert.match(t, /其中 1 个仍是未提交改动/);
+  assert.match(t, /仍未提交：login\.js/);
+});
+
 check("扫描调用的是 node，且只读源目录", () => {
   const nodeCalls = execCalls.filter((c) => c.bin === "node");
   assert.ok(nodeCalls.length >= 1);
@@ -524,7 +534,7 @@ await sleep(30);
 check("跳回原会话带上 engine/sessionId/workspace", () => {
   assert.equal(sessionOpens.length, 1);
   assert.equal(sessionOpens[0].engine, "claude");
-  assert.equal(sessionOpens[0].sessionId, "smoke-sess-1");
+  assert.equal(sessionOpens[0].sessionId, "a1b2c3d4-1111-2222-3333-444455556666");
   assert.equal(sessionOpens[0].workspacePath, repoDir);
 });
 
@@ -600,11 +610,12 @@ check("报告面板提供原文 / 预览切换", () => {
   assert.ok(previewBtn, "应有预览按钮");
   assert.ok(findByText(viewTree, "原文"), "应有原文按钮");
 });
-// 换成带标题、列表和表格的 Markdown，验证渲染
+// 换成带标题、列表、表格和会话引用的 Markdown，验证渲染
 const viewArea = byClass(viewTree, "wl-textarea");
 viewArea.props.onChange({
   target: {
-    value: "# 今日完成\n\n- 修复登录\n\n| 项目 | 耗时 |\n| --- | ---: |\n| 登录校验 | 2h |\n",
+    value:
+      "# 今日完成\n\n- 修复登录\n\n| 项目 | 耗时 |\n| --- | ---: |\n| 登录校验 | 2h |\n\n来源：a1b2c3d4\n",
   },
 });
 renderKeep(tabDef.component);
@@ -626,6 +637,19 @@ check("预览能渲染 Markdown 表格", () => {
   assert.match(t, /耗时/);
   assert.match(t, /登录校验/);
   assert.match(t, /2h/);
+});
+check("报告里引用的会话短 ID 渲染成可点击的按钮", () => {
+  const ref = byClass(previewTree, "wl-md-session");
+  assert.ok(ref, "应把会话短 ID 渲染成按钮");
+  assert.equal(textOf(ref), "a1b2c3d4");
+  assert.equal(ref.props.role || "button", "button");
+});
+// 点击引用后应调用 sessions.selectSession
+byClass(renderKeep(tabDef.component), "wl-md-session").props.onClick();
+await sleep(30);
+check("会话引用走的是同一个打开会话的动作", () => {
+  assert.equal(sessionOpens.length, 2);
+  assert.equal(sessionOpens[1].sessionId, "a1b2c3d4-1111-2222-3333-444455556666");
 });
 check("预览不写盘", () => {
   assert.match(fs.readFileSync(reportPath, "utf8"), /手动保存的内容/);
@@ -769,6 +793,10 @@ check("设置页的目录字段只读，没有可手动填写的输入框", () =
     settingInputs.every((n) => n.props.type === "checkbox"),
     "目录不应是可编辑 input"
   );
+});
+check("设置页明确说明目前只支持 Claude Code", () => {
+  const t = textOf(pickTree);
+  assert.match(t, /目前只支持 Claude Code/);
 });
 const pathTexts = [];
 walk(pickTree, (n) => {
@@ -998,12 +1026,165 @@ check("全部显示后工作区回到列表", () => {
 tree = renderFresh(tabDef.component);
 findByText(tree, "不看这个").props.onClick({ preventDefault: () => {}, stopPropagation: () => {} });
 await sleep(80);
-findByText(renderFresh(tabDef.component), "扫描当天").props.onClick();
+findByText(renderFresh(tabDef.component), "扫描").props.onClick();
 const rescanned = await waitFor(() => {
   const t = textOf(renderFresh(tabDef.component));
   return t.includes("修复登录校验") && !t.includes("本次已隐藏");
 }, 30000);
 check("重新扫描后隐藏的临时状态清空", () => assert.ok(rescanned));
+
+/* ------------------------------------------------------ 日期范围与周报 */
+
+const monday = (() => {
+  const d = new Date(DAY);
+  const dow = d.getDay();
+  const back = dow === 0 ? 6 : dow - 1;
+  d.setDate(d.getDate() - back);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+})();
+const weekFile = "reports/" + monday + "_" + DATE + "-weekly.md";
+
+check("页头提供单日 / 本周 / 自定义三种范围", () => {
+  const t = renderFresh(tabDef.component);
+  ["单日", "本周", "自定义"].forEach((label) => {
+    assert.ok(findByText(t, label), "应有「" + label + "」按钮");
+  });
+});
+
+findByText(renderFresh(tabDef.component), "本周").props.onClick();
+await sleep(60);
+check("点「本周」把范围切到本周一至今天", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.match(t, new RegExp(monday + " 至 " + DATE));
+});
+
+findByText(renderFresh(tabDef.component), "扫描").props.onClick();
+const weekScanned = await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 30000);
+check("多日范围也能扫描", () => assert.ok(weekScanned, "应完成扫描"));
+
+const lastNodeCall = execCalls.filter((c) => c.bin === "node").pop();
+check("多日范围把 --from/--to 传给扫描器", () => {
+  assert.ok(lastNodeCall, "应调用过 node");
+  const args = lastNodeCall.args.join(" ");
+  assert.ok(args.includes("--from " + monday), "应带 --from，实际 " + args);
+  assert.ok(args.includes("--to " + DATE), "应带 --to，实际 " + args);
+});
+
+check("周报口吻出现在报告面板", () => {
+  assert.ok(findByText(renderFresh(tabDef.component), "周报"), "应有周报按钮");
+});
+
+findByText(renderFresh(tabDef.component), "周报").props.onClick();
+await sleep(80);
+findByText(renderFresh(tabDef.component), "生成周报").props.onClick();
+const weekGenerated = await waitFor(
+  () => agentStarts.length >= 2 && !!byClass(renderFresh(tabDef.component), "wl-textarea"),
+  15000
+);
+check("周报使用周报的提示词模板", () => {
+  assert.ok(weekGenerated, "应发起生成并拿到文本");
+  const opts = agentStarts[agentStarts.length - 1];
+  assert.match(opts.prompt, /工作周报/);
+  assert.match(opts.prompt, /本周产出/);
+  assert.match(opts.prompt, new RegExp(monday + " 至 " + DATE));
+});
+
+// 保存一份多日报告，随后能从历史里点回来
+byClass(renderKeep(tabDef.component), "wl-textarea").props.onChange({
+  target: { value: "# 本周周报\n\n- 完成了登录校验\n" },
+});
+findByText(renderKeep(tabDef.component), "保存").props.onClick();
+await sleep(120);
+check("多日报告写进 from_to 文件名", () => {
+  const p = path.join(storageDir, weekFile);
+  assert.ok(fs.existsSync(p), "应有 " + weekFile);
+  assert.match(fs.readFileSync(p, "utf8"), /本周周报/);
+});
+
+// 回到单日，再从历史点回这份周报
+findByText(renderFresh(tabDef.component), "单日").props.onClick();
+await sleep(80);
+check("切回单日后范围回到今天", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.ok(!t.includes(monday + " 至 " + DATE), "不应还显示多日范围");
+});
+
+check("报告历史入口存在", () => {
+  assert.ok(findByText(renderFresh(tabDef.component), "报告历史"));
+});
+
+findByText(renderFresh(tabDef.component), "报告历史").props.onClick();
+// 展开状态留在组件内部：用 renderKeep 才能看到菜单
+await waitFor(() => !!byClass(renderKeep(tabDef.component), "wl-history-list"), 3000);
+await sleep(150);
+const historyTree = renderKeep(tabDef.component);
+const historyRows = [];
+walk(historyTree, (n) => {
+  const c = n.props && n.props.className;
+  if (typeof c === "string" && c.split(/\s+/).includes("wl-history-row")) historyRows.push(n);
+});
+check("报告历史按范围与口吻列已保存的报告", () => {
+  assert.ok(historyRows.length >= 2, "应有单日与多日两份，实际 " + historyRows.length);
+  const texts = historyRows.map((r) => textOf(r));
+  assert.ok(texts.some((t) => t.includes(monday + " 至 " + DATE)), "应列出本周这份");
+});
+
+const weekRow = historyRows.find((r) => textOf(r).includes(monday + " 至 " + DATE));
+weekRow.props.onClick();
+await sleep(200);
+check("点历史记录回到那份报告", () => {
+  const t = renderFresh(tabDef.component);
+  assert.match(textOf(t), new RegExp(monday + " 至 " + DATE));
+  const area = byClass(t, "wl-textarea");
+  assert.ok(area, "应显示报告内容");
+  assert.match(area.props.value, /本周周报/);
+});
+
+/* ------------------------------------------------------ 自定义口吻 */
+
+// 先渲染一次让自动保存 effect 记下基线，再点新增，改动才会被检测到
+const toneTree = renderKeep(settingsDef.component);
+const addToneBtn = findByText(toneTree, "新增口吻…");
+check("设置页有自定义口吻入口", () => assert.ok(addToneBtn));
+addToneBtn.props.onClick();
+renderKeep(settingsDef.component);
+await sleep(700);
+check("新增的口吻写进设置", () => {
+  const saved = storageData.get("worklog.settings.v1");
+  assert.ok(saved);
+  assert.equal(saved.customTones.length, 1);
+  assert.equal(saved.customTones[0].id, "t1");
+});
+
+check("报告面板出现自定义口吻按钮", () => {
+  const t = renderFresh(tabDef.component);
+  assert.ok(findByText(t, "自定义口吻 1"), "实际界面：" + textOf(byClass(t, "wl-report-head")));
+});
+
+// 切换范围会清空事实，重新扫一次再生成
+findByText(renderFresh(tabDef.component), "扫描").props.onClick();
+await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 30000);
+findByText(renderFresh(tabDef.component), "自定义口吻 1").props.onClick();
+// 切口吻要先读一次磁盘，等「生成」按钮的文案真的跟着变
+const toneSwitched = await waitFor(
+  () => !!findByText(renderFresh(tabDef.component), "生成自定义口吻 1"),
+  3000
+);
+check("切到自定义口吻后生成按钮跟着变", () => assert.ok(toneSwitched));
+const startsBefore = agentStarts.length;
+findByText(renderFresh(tabDef.component), "生成自定义口吻 1").props.onClick();
+const customGenerated = await waitFor(() => agentStarts.length > startsBefore, 10000);
+check("自定义口吻使用自己的模板并补上通用约束", () => {
+  assert.ok(customGenerated, "应发起生成");
+  const opts = agentStarts[agentStarts.length - 1];
+  assert.match(opts.prompt, /工作记录/);
+  assert.match(opts.prompt, /事实怎么读/);
+  assert.match(opts.prompt, /不要读取文件/);
+});
+
+check("设置页明确说明引擎日志只支持 Claude Code", () => {
+  assert.match(textOf(renderFresh(settingsDef.component)), /目前只支持 Claude Code/);
+});
 
 dispose2();
 
