@@ -49,9 +49,17 @@ const PRESETS = [
 ];
 
 const MAX_CUSTOM_TONES = 6;
+// 单个自定义口吻的名称/模板上限；设置页的输入框与 sanitizeCustomTones 共用
+const MAX_TONE_LABEL = 24;
+const MAX_TONE_PROMPT = 8000;
 const TONE_ID_RE = /^[a-z][a-z0-9]{0,15}$/;
+// 口吻 id 之后会直接拼进报告文件名；除格式外还要挡住 Object 原型上的名字
+const RESERVED_TONE_IDS = Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase());
 // 报告历史只给最近这么多份读大小；再多的只靠文件名列出，避免开个面板读上百个文件
 const MAX_REPORT_LIST_READ = 40;
+// 自定义范围一次最多看这么多天：再长就接近扫全库，node 子进程会超时，
+// 界面上也会长时间停在「扫描中」。
+const MAX_RANGE_DAYS = 92;
 
 /**
  * 引擎显示名。宿主的 catalog 只回 engine id，界面上给全名更好认。
@@ -76,7 +84,13 @@ const ENGINE_LABELS = {
 function engineLabel(id) {
   const key = String(id || "").trim();
   if (!key) return "";
-  return ENGINE_LABELS[key] || ENGINE_LABELS[key.toLowerCase()] || key;
+  const lower = key.toLowerCase();
+  // 宿主 catalog 的 id 是不可信输入：只认表里的自有属性，别把 constructor 之类当引擎名
+  const hit =
+    Object.prototype.hasOwnProperty.call(ENGINE_LABELS, key) ? ENGINE_LABELS[key]
+      : Object.prototype.hasOwnProperty.call(ENGINE_LABELS, lower) ? ENGINE_LABELS[lower]
+        : "";
+  return hit || key;
 }
 
 /** 可用的排前面，组内按显示名首字母排序（与 CLI 安装检测插件一致）。 */
@@ -820,8 +834,6 @@ const store = {
     report: "",
     reportSaved: "",
     reportMode: "daily",
-    // 自定义口吻（运行时从设置里同步过来，便于界面直接读）
-    customTones: [],
     // 报告历史列表：{ rel, key, mode, size, mtime }[]
     reportList: null,
     reportListLoading: false,
@@ -940,7 +952,7 @@ async function readSettings() {
 async function writeSettings(next) {
   // 先更新内存，主界面立即按新设置工作；写盘失败由调用方提示
   const clean = Object.assign({}, next, { customTones: sanitizeCustomTones(next.customTones) });
-  set({ settings: clean, customTones: clean.customTones });
+  set({ settings: clean });
   await appCtx.storage.set(SETTINGS_KEY, clean);
 }
 
@@ -1049,6 +1061,10 @@ async function scanRange(range) {
     facts = JSON.parse(doc.content);
   } catch (e) {
     throw new Error("扫描结果不是合法 JSON：" + safeError(e));
+  }
+  // 扫描器的适配器是唯一的：结果不是本引擎产出的，界面上就不能当成本引擎的事实展示
+  if (facts.engine && facts.engine !== SCAN_ENGINE_ID) {
+    throw new Error("扫描结果来自 " + engineLabel(facts.engine) + "，当前只能解析 " + SCAN_ENGINE_LABEL + " 的日志");
   }
   facts._elapsedMs = Date.now() - started;
   return facts;
@@ -1184,7 +1200,7 @@ async function execGit(args, timeoutMs) {
 }
 
 async function gitForWorkspace(workspace, range) {
-  const out = { workspace: workspace, isRepo: false, commits: [], dirty: [], error: "" };
+  const out = { workspace: workspace, isRepo: false, toplevel: "", commits: [], dirty: [], error: "" };
   if (!workspace) return out;
 
   let probe;
@@ -1199,6 +1215,15 @@ async function gitForWorkspace(workspace, range) {
     return out;
   }
   out.isRepo = true;
+
+  // git status 输出的路径以仓库根为基准，而工作区可能是仓库里的子目录（monorepo 常见）。
+  // 记下仓库根，换算路径时才知道该拿谁当基准。
+  try {
+    const tp = await execGit(["-C", workspace, "rev-parse", "--show-toplevel"]);
+    if (tp && tp.code === 0) out.toplevel = String(tp.stdout || "").trim();
+  } catch (e) {
+    /* 老版本 git 或裸仓库：回退成按工作区算 */
+  }
 
   const r = normalizeRange(range);
   const since = r.from + "T00:00:00";
@@ -1232,13 +1257,19 @@ async function gitForWorkspace(workspace, range) {
   }
 
   try {
-    const st = await execGit(["-C", workspace, "-c", "core.quotepath=false", "status", "--porcelain=v1"]);
+    // relativePaths=false：让路径固定以仓库根为基准，不受「从哪个子目录执行」影响
+    const st = await execGit([
+      "-C", workspace,
+      "-c", "core.quotepath=false",
+      "-c", "status.relativePaths=false",
+      "status", "--porcelain=v1",
+    ]);
     if (st && st.code === 0) {
       out.dirty = String(st.stdout || "")
         .split(/\r?\n/)
         .filter(Boolean)
         .slice(0, 200)
-        .map((line) => ({ code: line.slice(0, 2).trim(), path: line.slice(3).trim() }));
+        .map((line) => ({ code: line.slice(0, 2).trim(), path: statusPath(line.slice(3).trim()) }));
     }
   } catch (e) {
     /* 忽略 */
@@ -1249,22 +1280,35 @@ async function gitForWorkspace(workspace, range) {
 
 /* -------------------------------------------------------------- git 对账 */
 
-/** 把会话里记录的绝对路径换算成相对工作区的路径，方便和 git status 比对。 */
-function relToWorkspace(workspace, filePath) {
-  const ws = String(workspace || "").replace(/[\\/]+$/, "");
-  const f = String(filePath || "");
-  if (!ws || !f) return "";
+/** 把会话里记录的路径换算成相对 base（仓库根）的路径，方便和 git status 比对。
+ *  - 在 base 下：返回相对路径
+ *  - 本来就是相对路径：原样返回
+ *  - base 之外的绝对路径：返回 ""（不属于这个仓库，不参与对账） */
+function relToBase(base, filePath) {
+  const root = String(base || "").replace(/[\\/]+$/, "");
+  const f = String(filePath || "").trim();
+  if (!f) return "";
   const norm = (s) => s.replace(/\\/g, "/");
-  const a = norm(ws);
   const b = norm(f);
+  const isAbs = /^[a-zA-Z]:\//.test(b) || b.startsWith("/") || b.startsWith("//");
+  if (!root) return isAbs ? "" : b;
+  const a = norm(root);
   const win = isWindowsHost();
   const hit = win ? b.toLowerCase() === a.toLowerCase() : b === a;
   if (hit) return "";
   if (win ? b.toLowerCase().startsWith(a.toLowerCase() + "/") : b.startsWith(a + "/")) {
     return b.slice(a.length + 1);
   }
-  // 本来就已经是相对路径；不在这个工作区下的绝对路径也原样返回，靠调用方过滤
-  return b;
+  return isAbs ? "" : b;
+}
+
+/** git status --porcelain 的行尾路径：重命名是 "old -> new"，对账只关心当前路径。 */
+function statusPath(text) {
+  const raw = String(text || "").trim();
+  const arrow = raw.lastIndexOf(" -> ");
+  const p = arrow >= 0 ? raw.slice(arrow + 4) : raw;
+  // 带空格/特殊字符的路径会被整体加引号
+  return p.replace(/^"(.*)"$/, "$1").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
 }
 
 /**
@@ -1274,10 +1318,12 @@ function relToWorkspace(workspace, filePath) {
  * 只做「对不上」的提示，不替用户下结论。
  */
 function crossCheck(workspace, sessions, git) {
+  // git status 以仓库根为基准；会话里记的是绝对路径。两边都折到「相对仓库根」。
+  const base = (git && git.toplevel) || workspace;
   const edited = new Set();
   for (const s of sessions || []) {
     for (const f of s.editedFiles || []) {
-      const rel = relToWorkspace(workspace, f);
+      const rel = relToBase(base, f);
       if (rel) edited.add(rel);
     }
   }
@@ -1338,9 +1384,10 @@ async function pruneOldFacts(keepDays) {
     const list = await appCtx.documentStorage.list("runtime/");
     const cutoff = Date.now() - days * 86400000;
     for (const rel of list || []) {
-      const m = /facts-(\d{4}-\d{2}-\d{2})\.json$/.exec(String(rel));
+      // 快照名是 facts-<from>.json 或 facts-<from>_<to>.json；多日快照按结束日算年龄
+      const m = /facts-(\d{4}-\d{2}-\d{2})(?:_(\d{4}-\d{2}-\d{2}))?\.json$/.exec(String(rel));
       if (!m) continue;
-      const t = Date.parse(m[1] + "T00:00:00");
+      const t = Date.parse((m[2] || m[1]) + "T00:00:00");
       if (Number.isFinite(t) && t < cutoff) {
         try {
           await appCtx.documentStorage.remove(withDir("runtime", rel));
@@ -1509,27 +1556,40 @@ async function saveReportText(range, mode, text) {
 /** 切换范围或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
 let reportSwitchSeq = 0;
 
-async function switchReportMode(mode) {
-  if (mode === store.snap.reportMode || store.snap.generating) return;
-  const range = store.snap.range;
+/** 切到「范围 + 口吻」对应的报告：先用内存缓存立即换屏（有未保存草稿就用草稿），
+ *  读盘完成后再校正。extra 是调用方要一并改掉的其它状态（facts、预设等）。
+ *  切换范围、切换口吻、从历史点回来都走这里，读盘与防竞态只有一处。 */
+async function switchView(range, mode, extra) {
+  const r = normalizeRange(range);
+  const key = rangeKey(r);
   stashReportDraft();
   reportSwitchSeq += 1;
   const seq = reportSwitchSeq;
-  const key = REPORT_KEY(range, mode);
-  // 先用内存缓存立即切换，读盘完成后再校正，按钮不会卡在旧状态
-  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
-  const next = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
-  set({ reportMode: mode, report: next, reportSaved: savedNow, streamText: "" });
-  const text = await loadReportIntoCache(range, mode);
-  // 期间又切了模式或范围：这批结果已经过期
-  if (
-    seq !== reportSwitchSeq ||
-    rangeKey(store.snap.range) !== rangeKey(range) ||
-    store.snap.reportMode !== mode
-  ) {
-    return;
-  }
-  showReport(range, mode, text);
+  const rkey = REPORT_KEY(r, mode);
+  const savedNow = reportDiskText.has(rkey) ? reportDiskText.get(rkey) : "";
+  const cached = reportDraftText.has(rkey) ? reportDraftText.get(rkey) : savedNow;
+  set(
+    Object.assign(
+      {
+        range: r,
+        reportMode: mode,
+        report: cached,
+        reportSaved: savedNow,
+        streamText: "",
+      },
+      extra || {}
+    )
+  );
+  const text = await loadReportIntoCache(r, mode);
+  // 期间又切了范围或口吻：这批结果已经过期
+  if (seq !== reportSwitchSeq) return;
+  if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
+  showReport(r, mode, text);
+}
+
+async function switchReportMode(mode) {
+  if (mode === store.snap.reportMode || store.snap.generating) return;
+  await switchView(store.snap.range, mode);
 }
 
 /* ------------------------------------------------------------ 口吻与历史 */
@@ -1554,12 +1614,20 @@ function allTones(customList) {
       ? store.snap.settings.customTones
       : [];
   for (const t of custom) {
-    // 内置 id 不能被自定义项覆盖；其余 id 都算自定义口吻
-    if (!t || !t.id || Object.prototype.hasOwnProperty.call(BUILTIN_TONE_LABELS, t.id)) continue;
+    // 内置 id 不能被自定义项覆盖；原型链上的名字（constructor 等）也不能混进来
+    if (!t || !isValidToneId(t.id)) continue;
     const label = String(t.label || "").trim() || t.id;
     list.push({ id: t.id, label: label, short: label, builtin: false });
   }
   return list;
+}
+
+/** 口吻 id 是否可用作自定义口吻：格式合法、不占用内置 id、不是原型链上的名字。 */
+function isValidToneId(id) {
+  const s = String(id || "");
+  return TONE_ID_RE.test(s) &&
+    !Object.prototype.hasOwnProperty.call(BUILTIN_TONE_LABELS, s) &&
+    !RESERVED_TONE_IDS.includes(s);
 }
 
 function toneLabel(mode) {
@@ -1574,7 +1642,9 @@ function toneLabel(mode) {
  */
 function promptFor(mode, range) {
   const r = normalizeRange(range);
-  const builtin = PROMPTS[mode];
+  // 口吻 id 来自设置或报告文件名，可能是 constructor / valueof 之类；
+  // 直接 PROMPTS[mode] 会命中原型链，拿到 Object 构造函数当模板。
+  const builtin = Object.prototype.hasOwnProperty.call(PROMPTS, mode) ? PROMPTS[mode] : "";
   let text = builtin;
   if (!text) {
     const custom = (Array.isArray(store.snap.settings.customTones) ? store.snap.settings.customTones : [])
@@ -1600,20 +1670,18 @@ function promptFor(mode, range) {
   return String(text).replace(/<日期>/g, rangeLabel(r)).replace(/<日期起>/g, r.from).replace(/<日期止>/g, r.to);
 }
 
-/** 校验并规整自定义口吻列表：id 只能是半角小写字母数字，不能占用内置 id。
+/** 校验并规整自定义口吻列表：id 只能是半角小写字母数字，不能占用内置 id 或原型链上的名字。
  *  名称和模板允许暂时为空（用户正在编辑），渲染时各自有兜底。 */
 function sanitizeCustomTones(list) {
   const out = [];
-  const seen = new Set(Object.keys(BUILTIN_TONE_LABELS));
   for (const raw of Array.isArray(list) ? list : []) {
     if (!raw || typeof raw !== "object") continue;
     const id = String(raw.id || "").trim();
-    if (!TONE_ID_RE.test(id) || seen.has(id)) continue;
-    seen.add(id);
+    if (!isValidToneId(id) || out.some((t) => t.id === id)) continue;
     out.push({
       id: id,
-      label: String(raw.label || "").trim().slice(0, 24),
-      prompt: String(raw.prompt || "").slice(0, 8000),
+      label: String(raw.label || "").trim().slice(0, MAX_TONE_LABEL),
+      prompt: String(raw.prompt || "").slice(0, MAX_TONE_PROMPT),
     });
     if (out.length >= MAX_CUSTOM_TONES) break;
   }
@@ -1654,6 +1722,8 @@ async function loadReportList() {
     });
     const rows = metas.slice(0, MAX_REPORT_LIST_READ);
     for (const row of rows) {
+      // 已经有一轮新的读取在跑了：别白读后面的文件
+      if (seq !== reportListSeq) return;
       try {
         const doc = await appCtx.documentStorage.readText(row.rel);
         if (doc && typeof doc.content === "string") row.size = doc.content.length;
@@ -1661,6 +1731,7 @@ async function loadReportList() {
         /* 单个文件读不了不影响列表 */
       }
     }
+    if (seq !== reportListSeq) return;
     set({ reportList: metas });
   } catch (e) {
     if (seq === reportListSeq) set({ reportList: [] });
@@ -2162,33 +2233,15 @@ async function changeRange(next, preset) {
   const key = rangeKey(range);
   const pick = preset || store.snap.rangePreset;
   if (key === rangeKey(store.snap.range) && pick === store.snap.rangePreset) return;
-  stashReportDraft();
-  reportSwitchSeq += 1;
-  const seq = reportSwitchSeq;
-  const mode = store.snap.reportMode;
-  const rkey = REPORT_KEY(range, mode);
-  // 先展示缓存内容（有未保存草稿就是草稿），读盘后再校正
-  const savedNow = reportDiskText.has(rkey) ? reportDiskText.get(rkey) : "";
-  const cached = reportDraftText.has(rkey) ? reportDraftText.get(rkey) : savedNow;
-  const patch = {
-    range: range,
+  const extra = {
     rangePreset: pick,
     facts: null,
     git: null,
-    report: cached,
-    reportSaved: savedNow,
-    streamText: "",
     error: "",
     mutedWorkspaces: [],
   };
-  if (pick === "custom") patch.rangeDraft = range;
-  set(patch);
-  const text = await loadReportIntoCache(range, mode);
-  // 加载期间用户又换了范围或口吻
-  if (seq !== reportSwitchSeq) return;
-  if (rangeKey(store.snap.range) === key && store.snap.reportMode === mode) {
-    showReport(range, mode, text);
-  }
+  if (pick === "custom") extra.rangeDraft = range;
+  await switchView(range, store.snap.reportMode, extra);
 }
 
 /** 预设按钮：单日 = 今天，本周 = 本周一至今天，自定义 = 保留当前范围并展开两个日期框。 */
@@ -2221,6 +2274,11 @@ function changeRangeDraft(which, value) {
     if (which === "to" && draft.to < draft.from) draft.from = draft.to;
   }
   const range = normalizeRange(draft);
+  if (rangeDays(range) > MAX_RANGE_DAYS) {
+    // 不接受这次输入：界面上的日期值来自 store，会自己弹回去
+    flash("一次最多看 " + MAX_RANGE_DAYS + " 天，更长的范围会拖慢扫描");
+    return;
+  }
   set({ rangeDraft: range });
   void changeRange(range, "custom");
 }
@@ -2275,6 +2333,9 @@ function StatsStrip(props) {
 
 /** 产品自己的元素：当天每个工作区一行，横轴 00–24 点；唯一的蓝只落在这里。 */
 function DayTimeline(props) {
+  // 00–24 的横轴只对单日成立：多日范围里周一的 10 点和周四的 15 点被画成
+  // 一段连续区间，看起来像「同一天连干了 5 小时」。多日不画这条轴。
+  if (rangeDays(store.snap.range) > 1) return null;
   const facts = props.facts;
   const byId = new Map();
   for (const s of facts.sessions) byId.set(s.sessionId, s);
@@ -2608,7 +2669,8 @@ function FactsView(props) {
       { className: "wl-sub" },
       "来源核对：" + facts.totals.filesScanned + " 个会话文件 · " +
       facts.totals.sessions + " 个会话 · " +
-      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
+      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +
+      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
       (snap.rechecking ? " · 正在核对 git…" : "")
     ),
     mutedNames.length
@@ -2635,15 +2697,24 @@ function FactsView(props) {
 
 /* ---------------------------------------------------------------- Markdown 预览 */
 
-/** 会话短 ID（sessionId 前 8 位，界面与报告里都用它）→ 会话对象。 */
+/** 会话短 ID（sessionId 前 8 位，界面与报告里都用它）→ 会话对象。
+ *  renderMarkdown 对每个段落 / 列表项 / 表格单元格都调用行内渲染，
+ *  每次重建索引等于把整棵渲染树的开销乘上段落数。按 facts 引用缓存一份。 */
+let sessionIndexCache = { facts: null, muted: "", map: new Map() };
 function sessionIndex() {
   const facts = visibleFacts(store.snap.facts, store.snap.mutedWorkspaces);
-  const map = new Map();
-  if (!facts || !Array.isArray(facts.sessions)) return map;
-  for (const s of facts.sessions) {
-    const id = String(s.sessionId || "");
-    if (id.length >= 8) map.set(id.slice(0, 8).toLowerCase(), s);
+  const muted = (store.snap.mutedWorkspaces || []).join("\u0000");
+  if (sessionIndexCache.facts === facts && sessionIndexCache.muted === muted) {
+    return sessionIndexCache.map;
   }
+  const map = new Map();
+  if (facts && Array.isArray(facts.sessions)) {
+    for (const s of facts.sessions) {
+      const id = String(s.sessionId || "");
+      if (id.length >= 8) map.set(id.slice(0, 8).toLowerCase(), s);
+    }
+  }
+  sessionIndexCache = { facts: facts, muted: muted, map: map };
   return map;
 }
 
@@ -3186,30 +3257,14 @@ async function openReportEntry(entry) {
   if (!allTones().some((t) => t.id === mode)) {
     flash("这份报告的写法「" + mode + "」已经不存在了，只能查看不能重新生成");
   }
-  stashReportDraft();
-  reportSwitchSeq += 1;
-  const seq = reportSwitchSeq;
-  const key = REPORT_KEY(range, mode);
-  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
-  const cached = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
-  set({
-    range: range,
+  await switchView(range, mode, {
     rangePreset: range.from === range.to ? "day" : "custom",
     rangeDraft: range,
-    reportMode: mode,
     facts: null,
     git: null,
-    report: cached,
-    reportSaved: savedNow,
-    streamText: "",
     error: "",
     mutedWorkspaces: [],
   });
-  const text = await loadReportIntoCache(range, mode);
-  if (seq !== reportSwitchSeq) return;
-  if (rangeKey(store.snap.range) === rangeKey(range) && store.snap.reportMode === mode) {
-    showReport(range, mode, text);
-  }
 }
 
 /** 报告历史：点一条就切到那个范围与口吻，扫描后可直接看图。 */
@@ -3701,8 +3756,9 @@ function SettingsSection() {
     value: t.id,
     label: t.label + (t.builtin ? "" : "（自定义）"),
   }));
-  // 当前默认口吻的自定义项被删掉时，下拉回落到日报，避免留下空选项
-  if (!toneItems.some((t) => t.value === form.tone)) toneItems.unshift({ value: "daily", label: "工作日报" });
+  // 默认口吻认不出来（例如自定义项被删、设置被手改）时，下拉按日报显示。
+  // 不要在列表里插重复项，也不要在渲染期改写表单。
+  const toneValue = toneItems.some((t) => t.value === form.tone) ? form.tone : "daily";
 
   // 自定义口吻编辑器：id 只用来命名报告文件，界面上不展示
   const addCustomTone = () => {
@@ -3760,7 +3816,7 @@ function SettingsSection() {
             h("input", {
               className: "wl-input wl-tone-name",
               value: t.label || "",
-              maxLength: 24,
+              maxLength: MAX_TONE_LABEL,
               placeholder: "口吻名称，例如：周会发言稿",
               onChange: (e) => patchTone(i, "label", e.target.value),
             }),
@@ -3773,6 +3829,8 @@ function SettingsSection() {
             h("textarea", {
               className: "wl-textarea wl-tone-prompt",
               value: t.prompt || "",
+              // 与 sanitizeCustomTones 的上限一致：否则粘贴超长模板会「保存成功但内容变短」
+              maxLength: MAX_TONE_PROMPT,
               spellCheck: false,
               placeholder: "给模型的写作要求。用 <日期> 代表当前范围。",
               onChange: (e) => patchTone(i, "prompt", e.target.value),
@@ -3828,7 +3886,8 @@ function SettingsSection() {
   const dropdown = (key, items, opts) =>
     h(Dropdown, {
       items: items,
-      value: form[key] || "",
+      // opts.value 用于「表单里的值暂时认不出来」时给一个兜底显示值
+      value: opts && opts.value != null ? opts.value : form[key] || "",
       placeholder: opts && opts.placeholder,
       disabled: opts && opts.disabled,
       emptyText: opts && opts.emptyText,
@@ -3993,13 +4052,13 @@ function SettingsSection() {
         ),
         field(
           "打开时默认的口吻",
-          dropdown("tone", toneItems),
+          dropdown("tone", toneItems, { value: toneValue }),
           "报告面板打开时默认用哪一种写法。"
         ),
         field(
           "自定义口吻",
           toneEditor,
-          "最多 " + MAX_CUSTOM_TONES + " 个。模板里可用 <日期> 代表当前范围；内置的三种写法不受这里影响。"
+          "最多 " + MAX_CUSTOM_TONES + " 个（每个模板最多 8000 字）。模板里可用 <日期> 代表当前范围；内置的三种写法不受这里影响。"
         )
       )
     ),
@@ -4101,7 +4160,7 @@ async function bootstrap() {
     (settings.customTones || []).map((t) => t.id)
   );
   const mode = tones.includes(settings.tone) ? settings.tone : "daily";
-  set({ settings: settings, customTones: settings.customTones || [], ready: true, reportMode: mode });
+  set({ settings: settings, ready: true, reportMode: mode });
   void loadCatalog();
   void refreshStorageLocation();
   void cleanupReportBaks();

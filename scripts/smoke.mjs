@@ -467,6 +467,12 @@ fs.writeFileSync(path.join(storageDir, "runtime", "scan.mjs"), "// stale scanner
 const staleFactsName =
   "facts-" + new Date(Date.now() - 40 * 86400000).toISOString().slice(0, 10) + ".json";
 fs.writeFileSync(path.join(storageDir, "runtime", staleFactsName), "{}");
+// 多日快照是 facts-<from>_<to>.json，清理逻辑也得认
+const staleWeek =
+  "facts-" +
+  new Date(Date.now() - 47 * 86400000).toISOString().slice(0, 10) + "_" +
+  new Date(Date.now() - 40 * 86400000).toISOString().slice(0, 10) + ".json";
+fs.writeFileSync(path.join(storageDir, "runtime", staleWeek), "{}");
 // 重新激活以载入设置
 dispose();
 const dispose2 = mod.default(ctx);
@@ -495,6 +501,8 @@ check("扫描完成后展示来源核对与会话内容", () => {
   assert.match(t, /修复登录校验/);
   assert.match(t, /已加上空密码校验/);
   assert.match(t, /打开会话/);
+  // 单日才有 00–24 的横轴
+  assert.match(t, /今天的时间线/);
 });
 
 check("git 对账读到了当天的提交", () => {
@@ -524,6 +532,9 @@ check("旧扫描器被覆盖后不留下 .bak", () => {
 });
 check("超出保留期的旧事实快照会被清理", () => {
   assert.equal(fs.existsSync(path.join(storageDir, "runtime", staleFactsName)), false);
+});
+check("多日快照同样按结束日清理", () => {
+  assert.equal(fs.existsSync(path.join(storageDir, "runtime", staleWeek)), false);
 });
 
 // 点击「打开会话」
@@ -1061,6 +1072,11 @@ check("点「本周」把范围切到本周一至今天", () => {
 findByText(renderFresh(tabDef.component), "扫描").props.onClick();
 const weekScanned = await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 30000);
 check("多日范围也能扫描", () => assert.ok(weekScanned, "应完成扫描"));
+
+check("多日范围不画单日时间线", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.ok(!t.includes("今天的时间线"), "多日范围下 00–24 的横轴会把不同天画成连续区间");
+});
 
 const lastNodeCall = execCalls.filter((c) => c.bin === "node").pop();
 check("多日范围把 --from/--to 传给扫描器", () => {

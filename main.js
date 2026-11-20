@@ -49,9 +49,17 @@ const PRESETS = [
 ];
 
 const MAX_CUSTOM_TONES = 6;
+// 单个自定义口吻的名称/模板上限；设置页的输入框与 sanitizeCustomTones 共用
+const MAX_TONE_LABEL = 24;
+const MAX_TONE_PROMPT = 8000;
 const TONE_ID_RE = /^[a-z][a-z0-9]{0,15}$/;
+// 口吻 id 之后会直接拼进报告文件名；除格式外还要挡住 Object 原型上的名字
+const RESERVED_TONE_IDS = Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase());
 // 报告历史只给最近这么多份读大小；再多的只靠文件名列出，避免开个面板读上百个文件
 const MAX_REPORT_LIST_READ = 40;
+// 自定义范围一次最多看这么多天：再长就接近扫全库，node 子进程会超时，
+// 界面上也会长时间停在「扫描中」。
+const MAX_RANGE_DAYS = 92;
 
 /**
  * 引擎显示名。宿主的 catalog 只回 engine id，界面上给全名更好认。
@@ -76,7 +84,13 @@ const ENGINE_LABELS = {
 function engineLabel(id) {
   const key = String(id || "").trim();
   if (!key) return "";
-  return ENGINE_LABELS[key] || ENGINE_LABELS[key.toLowerCase()] || key;
+  const lower = key.toLowerCase();
+  // 宿主 catalog 的 id 是不可信输入：只认表里的自有属性，别把 constructor 之类当引擎名
+  const hit =
+    Object.prototype.hasOwnProperty.call(ENGINE_LABELS, key) ? ENGINE_LABELS[key]
+      : Object.prototype.hasOwnProperty.call(ENGINE_LABELS, lower) ? ENGINE_LABELS[lower]
+        : "";
+  return hit || key;
 }
 
 /** 可用的排前面，组内按显示名首字母排序（与 CLI 安装检测插件一致）。 */
@@ -89,7 +103,7 @@ function sortEngines(list) {
   });
 }
 
-const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\nimport readline from \"node:readline\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\nconst MAX_TOOL_ERRORS_PER_SESSION = 50;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n// 用户连续发言、助手还没回应时先排队的上限\nconst MAX_PENDING_TURNS = 5;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。\n *  只列已知标签，不用裸 \"<\" 兜底——用户会粘贴 HTML/XML/JSX，\n *  那种消息是真实需求，不能吞掉。 */\nconst INTERNAL_PREFIXES = [\n  \"<task-notification\",\n  \"<fork-boilerplate\",\n  \"<command-message\",\n  \"<command-name>\",\n  \"<command-args>\",\n  \"<local-command-stdout>\",\n  \"<local-command-stderr>\",\n  \"<local-command-caveat>\",\n  \"<system-reminder>\",\n  \"<user-prompt-submit-hook>\",\n  \"<bash-input>\",\n  \"<bash-stdout>\",\n  \"<bash-stderr>\",\n  \"<ide_opened_file>\",\n  \"<ide_selection>\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。\n      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */\nfunction messageContent(msg) {\n  if (!msg) return null;\n  const c = msg.content;\n  if (typeof c === \"string\") return c.trim() ? [{ type: \"text\", text: c }] : [];\n  if (Array.isArray(c)) return c;\n  return null;\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\n/* ------------------------------------------------------------ 引擎适配器\n * 扫描器只认识一种会话日志格式：Claude Code 的 JSONL。其它引擎（Codex、\n * Qoder、Kimi…）的字段名与目录布局都不同，没有真实样本前不臆造解析。\n * 这里把「读一行原始对象 → 规范字段」集中成适配器，后续接入新引擎时\n * 只需要新增一个条目，扫描主流程不用改。\n */\nconst ADAPTERS = {\n  claude: {\n    id: \"claude\",\n    label: \"Claude Code\",\n    /** 规范形状：{ ts, sessionId, workspace, branch, cliVersion, sidechain, kind, content } */\n    readLine(o) {\n      if (!o || typeof o !== \"object\") return null;\n      const kind = o.type === \"user\" || o.type === \"assistant\" ? o.type : \"\";\n      return {\n        ts: typeof o.timestamp === \"string\" ? o.timestamp : null,\n        sessionId: o.sessionId ? String(o.sessionId) : null,\n        workspace: o.cwd ? String(o.cwd) : \"\",\n        branch: o.gitBranch ? String(o.gitBranch) : null,\n        cliVersion: o.version ? String(o.version) : null,\n        sidechain: o.isSidechain === true,\n        kind: kind,\n        content: messageContent(o.message),\n      };\n    },\n  },\n};\n\nfunction resolveAdapter(name) {\n  const key = String(name || \"\").trim().toLowerCase();\n  if (!key || key === \"auto\") return ADAPTERS.claude;\n  return ADAPTERS[key] || null;\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd, adapter) {\n  const s = {\n    sessionId: null,\n    engine: adapter.id,\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    tools: {},\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: {},\n    commands: [],\n    hours: {},\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对\n  let pendingTurns = [];\n  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失\n  let carryTurn = null;\n\n  const rl = readline.createInterface({\n    input: fs.createReadStream(file.p, { encoding: \"utf8\" }),\n    crlfDelay: Infinity,\n  });\n\n  for await (const line of rl) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    const rec = adapter.readLine(o);\n    if (!rec) continue;\n    if (rec.sessionId && !s.sessionId) s.sessionId = rec.sessionId;\n    if (rec.workspace && !s.workspace) s.workspace = rec.workspace;\n    if (rec.branch && !s.gitBranch) s.gitBranch = rec.branch;\n    if (rec.cliVersion && !s.cliVersion) s.cliVersion = rec.cliVersion;\n\n    const tsRaw = rec.ts;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) {\n      sawAnyMessageBeforeWindow = true;\n      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对\n      if (rec.kind === \"user\" && !rec.sidechain) {\n        const early = rec.content;\n        if (early && !isToolResult(early)) {\n          const text = textBlocks(early).join(\"\\n\").trim();\n          if (text && !isInternalText(text)) {\n            carryTurn = {\n              ts: tsRaw,\n              user: clip(text, MAX_TURN_USER_TEXT),\n              fromEarlierDay: true,\n            };\n          }\n        }\n      }\n      continue;\n    }\n    if (ts >= windowEnd) continue;\n\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    const content = rec.content;\n    if (content === null) continue;\n\n    if (rec.sidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (rec.kind === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n          // 报错只保留最近的，避免单个会话几百条错误撑大快照\n          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      // 保留最近的 N 条：报告关心的是会话最后在做什么\n      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();\n      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });\n      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();\n      // 用户已经继续对话，之前窗口外的要求不再等待配对\n      carryTurn = null;\n      continue;\n    }\n\n    if (rec.kind === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            // 同样保留最近的命令\n            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上。\n      // 用户连续发了几条就合并成一个要求，不要只留最后一条。\n      if (replyText) {\n        let turn = null;\n        if (pendingTurns.length) {\n          turn = {\n            ts: pendingTurns[pendingTurns.length - 1].ts,\n            user: clip(pendingTurns.map((t) => t.user).join(\" / \"), MAX_TURN_USER_TEXT),\n            fromEarlierDay: false,\n          };\n          pendingTurns = [];\n        } else if (carryTurn) {\n          // 跨天：前一天的用户要求，当天才得到第一次回应\n          turn = carryTurn;\n          carryTurn = null;\n        }\n        if (turn) {\n          s.turns.push({\n            ts: turn.ts,\n            user: turn.user,\n            reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n            fromEarlierDay: turn.fromEarlierDay === true,\n          });\n          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        }\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: {}, userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // 目前只实现 Claude Code 的适配器；显式指定未知引擎时明确失败，\n  // 而不是悄悄按 Claude 的格式解析出一堆空会话。\n  const adapter = resolveAdapter(args.engine);\n  if (!adapter) {\n    throw new Error(\n      \"不支持引擎 \" + args.engine + \"；目前只能解析 Claude Code 的会话日志（--engine claude）\"\n    );\n  }\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」\n  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）\n  if (args.root && args.root !== \"auto\" && !fs.existsSync(root)) {\n    throw new Error(\"会话根目录不存在：\" + root);\n  }\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd, adapter);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    engine: adapter.id,\n    engineLabel: adapter.label,\n    supportedEngines: Object.keys(ADAPTERS),\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
+const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\nimport readline from \"node:readline\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\nconst MAX_TOOL_ERRORS_PER_SESSION = 50;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n// 用户连续发言、助手还没回应时先排队的上限\nconst MAX_PENDING_TURNS = 5;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。\n *  只列已知标签，不用裸 \"<\" 兜底——用户会粘贴 HTML/XML/JSX，\n *  那种消息是真实需求，不能吞掉。 */\nconst INTERNAL_PREFIXES = [\n  \"<task-notification\",\n  \"<fork-boilerplate\",\n  \"<command-message\",\n  \"<command-name>\",\n  \"<command-args>\",\n  \"<local-command-stdout>\",\n  \"<local-command-stderr>\",\n  \"<local-command-caveat>\",\n  \"<system-reminder>\",\n  \"<user-prompt-submit-hook>\",\n  \"<bash-input>\",\n  \"<bash-stdout>\",\n  \"<bash-stderr>\",\n  \"<ide_opened_file>\",\n  \"<ide_selection>\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。\n      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */\nfunction messageContent(msg) {\n  if (!msg) return null;\n  const c = msg.content;\n  if (typeof c === \"string\") return c.trim() ? [{ type: \"text\", text: c }] : [];\n  if (Array.isArray(c)) return c;\n  return null;\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\n/* ------------------------------------------------------------ 引擎适配器\n * 扫描器只认识一种会话日志格式：Claude Code 的 JSONL。其它引擎（Codex、\n * Qoder、Kimi…）的字段名与目录布局都不同，没有真实样本前不臆造解析。\n * 这里把「读一行原始对象 → 规范字段」集中成适配器，后续接入新引擎时\n * 只需要新增一个条目，扫描主流程不用改。\n */\nconst ADAPTERS = {\n  claude: {\n    id: \"claude\",\n    label: \"Claude Code\",\n    /** 规范形状：{ ts, sessionId, workspace, branch, cliVersion, sidechain, kind, content } */\n    readLine(o) {\n      if (!o || typeof o !== \"object\") return null;\n      const kind = o.type === \"user\" || o.type === \"assistant\" ? o.type : \"\";\n      return {\n        ts: typeof o.timestamp === \"string\" ? o.timestamp : null,\n        sessionId: o.sessionId ? String(o.sessionId) : null,\n        workspace: o.cwd ? String(o.cwd) : \"\",\n        branch: o.gitBranch ? String(o.gitBranch) : null,\n        cliVersion: o.version ? String(o.version) : null,\n        sidechain: o.isSidechain === true,\n        kind: kind,\n        content: messageContent(o.message),\n      };\n    },\n  },\n};\n\nfunction resolveAdapter(name) {\n  const key = String(name || \"\").trim().toLowerCase();\n  if (!key || key === \"auto\") return ADAPTERS.claude;\n  // 只认 ADAPTERS 的自有属性：constructor / __proto__ 之类会命中原型链，\n  // 拿到一个没有 readLine 的对象，最后变成「扫描成功但 0 个会话」。\n  return Object.prototype.hasOwnProperty.call(ADAPTERS, key) ? ADAPTERS[key] : null;\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd, adapter) {\n  const s = {\n    sessionId: null,\n    engine: adapter.id,\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    tools: {},\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: {},\n    commands: [],\n    hours: {},\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对\n  let pendingTurns = [];\n  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失\n  let carryTurn = null;\n\n  const rl = readline.createInterface({\n    input: fs.createReadStream(file.p, { encoding: \"utf8\" }),\n    crlfDelay: Infinity,\n  });\n\n  for await (const line of rl) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    const rec = adapter.readLine(o);\n    if (!rec) continue;\n    if (rec.sessionId && !s.sessionId) s.sessionId = rec.sessionId;\n    if (rec.workspace && !s.workspace) s.workspace = rec.workspace;\n    if (rec.branch && !s.gitBranch) s.gitBranch = rec.branch;\n    if (rec.cliVersion && !s.cliVersion) s.cliVersion = rec.cliVersion;\n\n    const tsRaw = rec.ts;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) {\n      sawAnyMessageBeforeWindow = true;\n      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对\n      if (rec.kind === \"user\" && !rec.sidechain) {\n        const early = rec.content;\n        if (early && !isToolResult(early)) {\n          const text = textBlocks(early).join(\"\\n\").trim();\n          if (text && !isInternalText(text)) {\n            carryTurn = {\n              ts: tsRaw,\n              user: clip(text, MAX_TURN_USER_TEXT),\n              fromEarlierDay: true,\n            };\n          }\n        }\n      }\n      continue;\n    }\n    if (ts >= windowEnd) continue;\n\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    const content = rec.content;\n    if (content === null) continue;\n\n    if (rec.sidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (rec.kind === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n          // 报错只保留最近的，避免单个会话几百条错误撑大快照\n          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      // 保留最近的 N 条：报告关心的是会话最后在做什么\n      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();\n      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });\n      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();\n      // 用户已经继续对话，之前窗口外的要求不再等待配对\n      carryTurn = null;\n      continue;\n    }\n\n    if (rec.kind === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            // 同样保留最近的命令\n            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上。\n      // 用户连续发了几条就合并成一个要求，不要只留最后一条。\n      if (replyText) {\n        let turn = null;\n        if (pendingTurns.length) {\n          turn = {\n            ts: pendingTurns[pendingTurns.length - 1].ts,\n            user: clip(pendingTurns.map((t) => t.user).join(\" / \"), MAX_TURN_USER_TEXT),\n            fromEarlierDay: false,\n          };\n          pendingTurns = [];\n        } else if (carryTurn) {\n          // 跨天：前一天的用户要求，当天才得到第一次回应\n          turn = carryTurn;\n          carryTurn = null;\n        }\n        if (turn) {\n          s.turns.push({\n            ts: turn.ts,\n            user: turn.user,\n            reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n            fromEarlierDay: turn.fromEarlierDay === true,\n          });\n          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        }\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: {}, userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // 目前只实现 Claude Code 的适配器；显式指定未知引擎时明确失败，\n  // 而不是悄悄按 Claude 的格式解析出一堆空会话。\n  const adapter = resolveAdapter(args.engine);\n  if (!adapter) {\n    throw new Error(\n      \"不支持引擎 \" + args.engine + \"；目前只能解析 Claude Code 的会话日志（--engine claude）\"\n    );\n  }\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」\n  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）\n  if (args.root && args.root !== \"auto\" && !fs.existsSync(root)) {\n    throw new Error(\"会话根目录不存在：\" + root);\n  }\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd, adapter);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    engine: adapter.id,\n    engineLabel: adapter.label,\n    supportedEngines: Object.keys(ADAPTERS),\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
 
 const CSS = `
 /* 设计方向：achromatic-ledger（浅色账本风格）。
@@ -820,8 +834,6 @@ const store = {
     report: "",
     reportSaved: "",
     reportMode: "daily",
-    // 自定义口吻（运行时从设置里同步过来，便于界面直接读）
-    customTones: [],
     // 报告历史列表：{ rel, key, mode, size, mtime }[]
     reportList: null,
     reportListLoading: false,
@@ -940,7 +952,7 @@ async function readSettings() {
 async function writeSettings(next) {
   // 先更新内存，主界面立即按新设置工作；写盘失败由调用方提示
   const clean = Object.assign({}, next, { customTones: sanitizeCustomTones(next.customTones) });
-  set({ settings: clean, customTones: clean.customTones });
+  set({ settings: clean });
   await appCtx.storage.set(SETTINGS_KEY, clean);
 }
 
@@ -1049,6 +1061,10 @@ async function scanRange(range) {
     facts = JSON.parse(doc.content);
   } catch (e) {
     throw new Error("扫描结果不是合法 JSON：" + safeError(e));
+  }
+  // 扫描器的适配器是唯一的：结果不是本引擎产出的，界面上就不能当成本引擎的事实展示
+  if (facts.engine && facts.engine !== SCAN_ENGINE_ID) {
+    throw new Error("扫描结果来自 " + engineLabel(facts.engine) + "，当前只能解析 " + SCAN_ENGINE_LABEL + " 的日志");
   }
   facts._elapsedMs = Date.now() - started;
   return facts;
@@ -1184,7 +1200,7 @@ async function execGit(args, timeoutMs) {
 }
 
 async function gitForWorkspace(workspace, range) {
-  const out = { workspace: workspace, isRepo: false, commits: [], dirty: [], error: "" };
+  const out = { workspace: workspace, isRepo: false, toplevel: "", commits: [], dirty: [], error: "" };
   if (!workspace) return out;
 
   let probe;
@@ -1199,6 +1215,15 @@ async function gitForWorkspace(workspace, range) {
     return out;
   }
   out.isRepo = true;
+
+  // git status 输出的路径以仓库根为基准，而工作区可能是仓库里的子目录（monorepo 常见）。
+  // 记下仓库根，换算路径时才知道该拿谁当基准。
+  try {
+    const tp = await execGit(["-C", workspace, "rev-parse", "--show-toplevel"]);
+    if (tp && tp.code === 0) out.toplevel = String(tp.stdout || "").trim();
+  } catch (e) {
+    /* 老版本 git 或裸仓库：回退成按工作区算 */
+  }
 
   const r = normalizeRange(range);
   const since = r.from + "T00:00:00";
@@ -1232,13 +1257,19 @@ async function gitForWorkspace(workspace, range) {
   }
 
   try {
-    const st = await execGit(["-C", workspace, "-c", "core.quotepath=false", "status", "--porcelain=v1"]);
+    // relativePaths=false：让路径固定以仓库根为基准，不受「从哪个子目录执行」影响
+    const st = await execGit([
+      "-C", workspace,
+      "-c", "core.quotepath=false",
+      "-c", "status.relativePaths=false",
+      "status", "--porcelain=v1",
+    ]);
     if (st && st.code === 0) {
       out.dirty = String(st.stdout || "")
         .split(/\r?\n/)
         .filter(Boolean)
         .slice(0, 200)
-        .map((line) => ({ code: line.slice(0, 2).trim(), path: line.slice(3).trim() }));
+        .map((line) => ({ code: line.slice(0, 2).trim(), path: statusPath(line.slice(3).trim()) }));
     }
   } catch (e) {
     /* 忽略 */
@@ -1249,22 +1280,35 @@ async function gitForWorkspace(workspace, range) {
 
 /* -------------------------------------------------------------- git 对账 */
 
-/** 把会话里记录的绝对路径换算成相对工作区的路径，方便和 git status 比对。 */
-function relToWorkspace(workspace, filePath) {
-  const ws = String(workspace || "").replace(/[\\/]+$/, "");
-  const f = String(filePath || "");
-  if (!ws || !f) return "";
+/** 把会话里记录的路径换算成相对 base（仓库根）的路径，方便和 git status 比对。
+ *  - 在 base 下：返回相对路径
+ *  - 本来就是相对路径：原样返回
+ *  - base 之外的绝对路径：返回 ""（不属于这个仓库，不参与对账） */
+function relToBase(base, filePath) {
+  const root = String(base || "").replace(/[\\/]+$/, "");
+  const f = String(filePath || "").trim();
+  if (!f) return "";
   const norm = (s) => s.replace(/\\/g, "/");
-  const a = norm(ws);
   const b = norm(f);
+  const isAbs = /^[a-zA-Z]:\//.test(b) || b.startsWith("/") || b.startsWith("//");
+  if (!root) return isAbs ? "" : b;
+  const a = norm(root);
   const win = isWindowsHost();
   const hit = win ? b.toLowerCase() === a.toLowerCase() : b === a;
   if (hit) return "";
   if (win ? b.toLowerCase().startsWith(a.toLowerCase() + "/") : b.startsWith(a + "/")) {
     return b.slice(a.length + 1);
   }
-  // 本来就已经是相对路径；不在这个工作区下的绝对路径也原样返回，靠调用方过滤
-  return b;
+  return isAbs ? "" : b;
+}
+
+/** git status --porcelain 的行尾路径：重命名是 "old -> new"，对账只关心当前路径。 */
+function statusPath(text) {
+  const raw = String(text || "").trim();
+  const arrow = raw.lastIndexOf(" -> ");
+  const p = arrow >= 0 ? raw.slice(arrow + 4) : raw;
+  // 带空格/特殊字符的路径会被整体加引号
+  return p.replace(/^"(.*)"$/, "$1").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
 }
 
 /**
@@ -1274,10 +1318,12 @@ function relToWorkspace(workspace, filePath) {
  * 只做「对不上」的提示，不替用户下结论。
  */
 function crossCheck(workspace, sessions, git) {
+  // git status 以仓库根为基准；会话里记的是绝对路径。两边都折到「相对仓库根」。
+  const base = (git && git.toplevel) || workspace;
   const edited = new Set();
   for (const s of sessions || []) {
     for (const f of s.editedFiles || []) {
-      const rel = relToWorkspace(workspace, f);
+      const rel = relToBase(base, f);
       if (rel) edited.add(rel);
     }
   }
@@ -1338,9 +1384,10 @@ async function pruneOldFacts(keepDays) {
     const list = await appCtx.documentStorage.list("runtime/");
     const cutoff = Date.now() - days * 86400000;
     for (const rel of list || []) {
-      const m = /facts-(\d{4}-\d{2}-\d{2})\.json$/.exec(String(rel));
+      // 快照名是 facts-<from>.json 或 facts-<from>_<to>.json；多日快照按结束日算年龄
+      const m = /facts-(\d{4}-\d{2}-\d{2})(?:_(\d{4}-\d{2}-\d{2}))?\.json$/.exec(String(rel));
       if (!m) continue;
-      const t = Date.parse(m[1] + "T00:00:00");
+      const t = Date.parse((m[2] || m[1]) + "T00:00:00");
       if (Number.isFinite(t) && t < cutoff) {
         try {
           await appCtx.documentStorage.remove(withDir("runtime", rel));
@@ -1509,27 +1556,40 @@ async function saveReportText(range, mode, text) {
 /** 切换范围或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
 let reportSwitchSeq = 0;
 
-async function switchReportMode(mode) {
-  if (mode === store.snap.reportMode || store.snap.generating) return;
-  const range = store.snap.range;
+/** 切到「范围 + 口吻」对应的报告：先用内存缓存立即换屏（有未保存草稿就用草稿），
+ *  读盘完成后再校正。extra 是调用方要一并改掉的其它状态（facts、预设等）。
+ *  切换范围、切换口吻、从历史点回来都走这里，读盘与防竞态只有一处。 */
+async function switchView(range, mode, extra) {
+  const r = normalizeRange(range);
+  const key = rangeKey(r);
   stashReportDraft();
   reportSwitchSeq += 1;
   const seq = reportSwitchSeq;
-  const key = REPORT_KEY(range, mode);
-  // 先用内存缓存立即切换，读盘完成后再校正，按钮不会卡在旧状态
-  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
-  const next = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
-  set({ reportMode: mode, report: next, reportSaved: savedNow, streamText: "" });
-  const text = await loadReportIntoCache(range, mode);
-  // 期间又切了模式或范围：这批结果已经过期
-  if (
-    seq !== reportSwitchSeq ||
-    rangeKey(store.snap.range) !== rangeKey(range) ||
-    store.snap.reportMode !== mode
-  ) {
-    return;
-  }
-  showReport(range, mode, text);
+  const rkey = REPORT_KEY(r, mode);
+  const savedNow = reportDiskText.has(rkey) ? reportDiskText.get(rkey) : "";
+  const cached = reportDraftText.has(rkey) ? reportDraftText.get(rkey) : savedNow;
+  set(
+    Object.assign(
+      {
+        range: r,
+        reportMode: mode,
+        report: cached,
+        reportSaved: savedNow,
+        streamText: "",
+      },
+      extra || {}
+    )
+  );
+  const text = await loadReportIntoCache(r, mode);
+  // 期间又切了范围或口吻：这批结果已经过期
+  if (seq !== reportSwitchSeq) return;
+  if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
+  showReport(r, mode, text);
+}
+
+async function switchReportMode(mode) {
+  if (mode === store.snap.reportMode || store.snap.generating) return;
+  await switchView(store.snap.range, mode);
 }
 
 /* ------------------------------------------------------------ 口吻与历史 */
@@ -1554,12 +1614,20 @@ function allTones(customList) {
       ? store.snap.settings.customTones
       : [];
   for (const t of custom) {
-    // 内置 id 不能被自定义项覆盖；其余 id 都算自定义口吻
-    if (!t || !t.id || Object.prototype.hasOwnProperty.call(BUILTIN_TONE_LABELS, t.id)) continue;
+    // 内置 id 不能被自定义项覆盖；原型链上的名字（constructor 等）也不能混进来
+    if (!t || !isValidToneId(t.id)) continue;
     const label = String(t.label || "").trim() || t.id;
     list.push({ id: t.id, label: label, short: label, builtin: false });
   }
   return list;
+}
+
+/** 口吻 id 是否可用作自定义口吻：格式合法、不占用内置 id、不是原型链上的名字。 */
+function isValidToneId(id) {
+  const s = String(id || "");
+  return TONE_ID_RE.test(s) &&
+    !Object.prototype.hasOwnProperty.call(BUILTIN_TONE_LABELS, s) &&
+    !RESERVED_TONE_IDS.includes(s);
 }
 
 function toneLabel(mode) {
@@ -1574,7 +1642,9 @@ function toneLabel(mode) {
  */
 function promptFor(mode, range) {
   const r = normalizeRange(range);
-  const builtin = PROMPTS[mode];
+  // 口吻 id 来自设置或报告文件名，可能是 constructor / valueof 之类；
+  // 直接 PROMPTS[mode] 会命中原型链，拿到 Object 构造函数当模板。
+  const builtin = Object.prototype.hasOwnProperty.call(PROMPTS, mode) ? PROMPTS[mode] : "";
   let text = builtin;
   if (!text) {
     const custom = (Array.isArray(store.snap.settings.customTones) ? store.snap.settings.customTones : [])
@@ -1600,20 +1670,18 @@ function promptFor(mode, range) {
   return String(text).replace(/<日期>/g, rangeLabel(r)).replace(/<日期起>/g, r.from).replace(/<日期止>/g, r.to);
 }
 
-/** 校验并规整自定义口吻列表：id 只能是半角小写字母数字，不能占用内置 id。
+/** 校验并规整自定义口吻列表：id 只能是半角小写字母数字，不能占用内置 id 或原型链上的名字。
  *  名称和模板允许暂时为空（用户正在编辑），渲染时各自有兜底。 */
 function sanitizeCustomTones(list) {
   const out = [];
-  const seen = new Set(Object.keys(BUILTIN_TONE_LABELS));
   for (const raw of Array.isArray(list) ? list : []) {
     if (!raw || typeof raw !== "object") continue;
     const id = String(raw.id || "").trim();
-    if (!TONE_ID_RE.test(id) || seen.has(id)) continue;
-    seen.add(id);
+    if (!isValidToneId(id) || out.some((t) => t.id === id)) continue;
     out.push({
       id: id,
-      label: String(raw.label || "").trim().slice(0, 24),
-      prompt: String(raw.prompt || "").slice(0, 8000),
+      label: String(raw.label || "").trim().slice(0, MAX_TONE_LABEL),
+      prompt: String(raw.prompt || "").slice(0, MAX_TONE_PROMPT),
     });
     if (out.length >= MAX_CUSTOM_TONES) break;
   }
@@ -1654,6 +1722,8 @@ async function loadReportList() {
     });
     const rows = metas.slice(0, MAX_REPORT_LIST_READ);
     for (const row of rows) {
+      // 已经有一轮新的读取在跑了：别白读后面的文件
+      if (seq !== reportListSeq) return;
       try {
         const doc = await appCtx.documentStorage.readText(row.rel);
         if (doc && typeof doc.content === "string") row.size = doc.content.length;
@@ -1661,6 +1731,7 @@ async function loadReportList() {
         /* 单个文件读不了不影响列表 */
       }
     }
+    if (seq !== reportListSeq) return;
     set({ reportList: metas });
   } catch (e) {
     if (seq === reportListSeq) set({ reportList: [] });
@@ -2162,33 +2233,15 @@ async function changeRange(next, preset) {
   const key = rangeKey(range);
   const pick = preset || store.snap.rangePreset;
   if (key === rangeKey(store.snap.range) && pick === store.snap.rangePreset) return;
-  stashReportDraft();
-  reportSwitchSeq += 1;
-  const seq = reportSwitchSeq;
-  const mode = store.snap.reportMode;
-  const rkey = REPORT_KEY(range, mode);
-  // 先展示缓存内容（有未保存草稿就是草稿），读盘后再校正
-  const savedNow = reportDiskText.has(rkey) ? reportDiskText.get(rkey) : "";
-  const cached = reportDraftText.has(rkey) ? reportDraftText.get(rkey) : savedNow;
-  const patch = {
-    range: range,
+  const extra = {
     rangePreset: pick,
     facts: null,
     git: null,
-    report: cached,
-    reportSaved: savedNow,
-    streamText: "",
     error: "",
     mutedWorkspaces: [],
   };
-  if (pick === "custom") patch.rangeDraft = range;
-  set(patch);
-  const text = await loadReportIntoCache(range, mode);
-  // 加载期间用户又换了范围或口吻
-  if (seq !== reportSwitchSeq) return;
-  if (rangeKey(store.snap.range) === key && store.snap.reportMode === mode) {
-    showReport(range, mode, text);
-  }
+  if (pick === "custom") extra.rangeDraft = range;
+  await switchView(range, store.snap.reportMode, extra);
 }
 
 /** 预设按钮：单日 = 今天，本周 = 本周一至今天，自定义 = 保留当前范围并展开两个日期框。 */
@@ -2221,6 +2274,11 @@ function changeRangeDraft(which, value) {
     if (which === "to" && draft.to < draft.from) draft.from = draft.to;
   }
   const range = normalizeRange(draft);
+  if (rangeDays(range) > MAX_RANGE_DAYS) {
+    // 不接受这次输入：界面上的日期值来自 store，会自己弹回去
+    flash("一次最多看 " + MAX_RANGE_DAYS + " 天，更长的范围会拖慢扫描");
+    return;
+  }
   set({ rangeDraft: range });
   void changeRange(range, "custom");
 }
@@ -2275,6 +2333,9 @@ function StatsStrip(props) {
 
 /** 产品自己的元素：当天每个工作区一行，横轴 00–24 点；唯一的蓝只落在这里。 */
 function DayTimeline(props) {
+  // 00–24 的横轴只对单日成立：多日范围里周一的 10 点和周四的 15 点被画成
+  // 一段连续区间，看起来像「同一天连干了 5 小时」。多日不画这条轴。
+  if (rangeDays(store.snap.range) > 1) return null;
   const facts = props.facts;
   const byId = new Map();
   for (const s of facts.sessions) byId.set(s.sessionId, s);
@@ -2608,7 +2669,8 @@ function FactsView(props) {
       { className: "wl-sub" },
       "来源核对：" + facts.totals.filesScanned + " 个会话文件 · " +
       facts.totals.sessions + " 个会话 · " +
-      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
+      (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +
+      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
       (snap.rechecking ? " · 正在核对 git…" : "")
     ),
     mutedNames.length
@@ -2635,15 +2697,24 @@ function FactsView(props) {
 
 /* ---------------------------------------------------------------- Markdown 预览 */
 
-/** 会话短 ID（sessionId 前 8 位，界面与报告里都用它）→ 会话对象。 */
+/** 会话短 ID（sessionId 前 8 位，界面与报告里都用它）→ 会话对象。
+ *  renderMarkdown 对每个段落 / 列表项 / 表格单元格都调用行内渲染，
+ *  每次重建索引等于把整棵渲染树的开销乘上段落数。按 facts 引用缓存一份。 */
+let sessionIndexCache = { facts: null, muted: "", map: new Map() };
 function sessionIndex() {
   const facts = visibleFacts(store.snap.facts, store.snap.mutedWorkspaces);
-  const map = new Map();
-  if (!facts || !Array.isArray(facts.sessions)) return map;
-  for (const s of facts.sessions) {
-    const id = String(s.sessionId || "");
-    if (id.length >= 8) map.set(id.slice(0, 8).toLowerCase(), s);
+  const muted = (store.snap.mutedWorkspaces || []).join("\u0000");
+  if (sessionIndexCache.facts === facts && sessionIndexCache.muted === muted) {
+    return sessionIndexCache.map;
   }
+  const map = new Map();
+  if (facts && Array.isArray(facts.sessions)) {
+    for (const s of facts.sessions) {
+      const id = String(s.sessionId || "");
+      if (id.length >= 8) map.set(id.slice(0, 8).toLowerCase(), s);
+    }
+  }
+  sessionIndexCache = { facts: facts, muted: muted, map: map };
   return map;
 }
 
@@ -3186,30 +3257,14 @@ async function openReportEntry(entry) {
   if (!allTones().some((t) => t.id === mode)) {
     flash("这份报告的写法「" + mode + "」已经不存在了，只能查看不能重新生成");
   }
-  stashReportDraft();
-  reportSwitchSeq += 1;
-  const seq = reportSwitchSeq;
-  const key = REPORT_KEY(range, mode);
-  const savedNow = reportDiskText.has(key) ? reportDiskText.get(key) : "";
-  const cached = reportDraftText.has(key) ? reportDraftText.get(key) : savedNow;
-  set({
-    range: range,
+  await switchView(range, mode, {
     rangePreset: range.from === range.to ? "day" : "custom",
     rangeDraft: range,
-    reportMode: mode,
     facts: null,
     git: null,
-    report: cached,
-    reportSaved: savedNow,
-    streamText: "",
     error: "",
     mutedWorkspaces: [],
   });
-  const text = await loadReportIntoCache(range, mode);
-  if (seq !== reportSwitchSeq) return;
-  if (rangeKey(store.snap.range) === rangeKey(range) && store.snap.reportMode === mode) {
-    showReport(range, mode, text);
-  }
 }
 
 /** 报告历史：点一条就切到那个范围与口吻，扫描后可直接看图。 */
@@ -3701,8 +3756,9 @@ function SettingsSection() {
     value: t.id,
     label: t.label + (t.builtin ? "" : "（自定义）"),
   }));
-  // 当前默认口吻的自定义项被删掉时，下拉回落到日报，避免留下空选项
-  if (!toneItems.some((t) => t.value === form.tone)) toneItems.unshift({ value: "daily", label: "工作日报" });
+  // 默认口吻认不出来（例如自定义项被删、设置被手改）时，下拉按日报显示。
+  // 不要在列表里插重复项，也不要在渲染期改写表单。
+  const toneValue = toneItems.some((t) => t.value === form.tone) ? form.tone : "daily";
 
   // 自定义口吻编辑器：id 只用来命名报告文件，界面上不展示
   const addCustomTone = () => {
@@ -3760,7 +3816,7 @@ function SettingsSection() {
             h("input", {
               className: "wl-input wl-tone-name",
               value: t.label || "",
-              maxLength: 24,
+              maxLength: MAX_TONE_LABEL,
               placeholder: "口吻名称，例如：周会发言稿",
               onChange: (e) => patchTone(i, "label", e.target.value),
             }),
@@ -3773,6 +3829,8 @@ function SettingsSection() {
             h("textarea", {
               className: "wl-textarea wl-tone-prompt",
               value: t.prompt || "",
+              // 与 sanitizeCustomTones 的上限一致：否则粘贴超长模板会「保存成功但内容变短」
+              maxLength: MAX_TONE_PROMPT,
               spellCheck: false,
               placeholder: "给模型的写作要求。用 <日期> 代表当前范围。",
               onChange: (e) => patchTone(i, "prompt", e.target.value),
@@ -3828,7 +3886,8 @@ function SettingsSection() {
   const dropdown = (key, items, opts) =>
     h(Dropdown, {
       items: items,
-      value: form[key] || "",
+      // opts.value 用于「表单里的值暂时认不出来」时给一个兜底显示值
+      value: opts && opts.value != null ? opts.value : form[key] || "",
       placeholder: opts && opts.placeholder,
       disabled: opts && opts.disabled,
       emptyText: opts && opts.emptyText,
@@ -3993,13 +4052,13 @@ function SettingsSection() {
         ),
         field(
           "打开时默认的口吻",
-          dropdown("tone", toneItems),
+          dropdown("tone", toneItems, { value: toneValue }),
           "报告面板打开时默认用哪一种写法。"
         ),
         field(
           "自定义口吻",
           toneEditor,
-          "最多 " + MAX_CUSTOM_TONES + " 个。模板里可用 <日期> 代表当前范围；内置的三种写法不受这里影响。"
+          "最多 " + MAX_CUSTOM_TONES + " 个（每个模板最多 8000 字）。模板里可用 <日期> 代表当前范围；内置的三种写法不受这里影响。"
         )
       )
     ),
@@ -4101,7 +4160,7 @@ async function bootstrap() {
     (settings.customTones || []).map((t) => t.id)
   );
   const mode = tones.includes(settings.tone) ? settings.tone : "daily";
-  set({ settings: settings, customTones: settings.customTones || [], ready: true, reportMode: mode });
+  set({ settings: settings, ready: true, reportMode: mode });
   void loadCatalog();
   void refreshStorageLocation();
   void cleanupReportBaks();

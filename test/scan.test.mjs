@@ -386,3 +386,21 @@ test("扫描：指定未知引擎时明确失败，不按 Claude 格式硬解析
   assert.notEqual(err.status, 0);
   assert.match(String(err.stderr || ""), /不支持引擎 codex/);
 });
+
+test("扫描：--engine 命中原型链名字时同样明确失败", () => {
+  const { dir } = makeFixture();
+  for (const name of ["constructor", "__proto__", "toString"]) {
+    let err = null;
+    try {
+      execFileSync(process.execPath, [SCAN, "--root", dir, "--date", DATE, "--engine", name], {
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, name + " 应非零退出");
+    assert.notEqual(err.status, 0);
+    assert.match(String(err.stderr || ""), /不支持引擎/, name + " 应报不支持引擎");
+  }
+});

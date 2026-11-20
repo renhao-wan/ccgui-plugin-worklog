@@ -182,7 +182,9 @@ const ADAPTERS = {
 function resolveAdapter(name) {
   const key = String(name || "").trim().toLowerCase();
   if (!key || key === "auto") return ADAPTERS.claude;
-  return ADAPTERS[key] || null;
+  // 只认 ADAPTERS 的自有属性：constructor / __proto__ 之类会命中原型链，
+  // 拿到一个没有 readLine 的对象，最后变成「扫描成功但 0 个会话」。
+  return Object.prototype.hasOwnProperty.call(ADAPTERS, key) ? ADAPTERS[key] : null;
 }
 
 async function scanSessionFile(file, windowStart, windowEnd, adapter) {
