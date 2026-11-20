@@ -225,6 +225,63 @@ test("扫描：字符串形式的用户消息也要计入", () => {
   );
 });
 
+test("扫描：插件自己生成报告留下的会话不算工作产出", () => {
+  // 宿主跑 agent 会把这一轮写进会话日志。默认 cwd 在插件数据目录下，
+  // 但用户也可能把它指到真实项目里，所以扫描器本身也要认得出来。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-self-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-self", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [
+    {
+      ...base,
+      type: "user",
+      timestamp: at(9, 0),
+      message: {
+        role: "user",
+        content: "你是一位替工程师写工作日报的助手。只依据下面提供的事实写作，不要补充事实中不存在的内容。",
+      },
+    },
+    {
+      ...base,
+      type: "assistant",
+      timestamp: at(9, 1),
+      message: { role: "assistant", content: [{ type: "text", text: "# 工作日报" }] },
+    },
+  ];
+  fs.writeFileSync(path.join(projectDir, "self.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const r = run(dir);
+  assert.equal(r.totals.sessions, 0, "插件自身生成的会话不应计入");
+});
+
+test("扫描：用户真的要求写日报时不会被误当成插件自身会话", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-ask-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(projectDir, { recursive: true });
+
+  const base = { sessionId: "s-ask", cwd: "D:\\proj\\demo", isSidechain: false };
+  const rows = [
+    {
+      ...base,
+      type: "user",
+      timestamp: at(9, 0),
+      message: { role: "user", content: "帮我写一份日报，把今天的改动整理一下" },
+    },
+    {
+      ...base,
+      type: "assistant",
+      timestamp: at(9, 1),
+      message: { role: "assistant", content: [{ type: "text", text: "好的" }] },
+    },
+  ];
+  fs.writeFileSync(path.join(projectDir, "ask.jsonl"), rows.map(line).join("\n"), "utf8");
+
+  const r = run(dir);
+  assert.equal(r.totals.sessions, 1, "用户自己的写日报请求是真实工作，不能过滤");
+});
+
 test("扫描：以 HTML 标签开头的真实输入不会被当成内部注入", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "worklog-html-"));
   const projectDir = path.join(dir, "proj");

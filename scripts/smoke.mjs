@@ -1100,6 +1100,16 @@ check("周报口吻出现在报告面板", () => {
   assert.ok(findByText(renderFresh(tabDef.component), "周报"), "应有周报按钮");
 });
 
+// 三种范围 × 三种口吻都允许选，但范围不匹配时要说明后果（只提示，不禁用）
+check("多日范围选日报时给出范围不匹配的提示", () => {
+  const t = renderFresh(tabDef.component);
+  const btn = findByText(t, "周报");
+  assert.ok(!btn.props.disabled, "周报按钮不该被禁用");
+  // 当前生效口吻是日报，多日范围下要提示「今日/明天」会变笼统
+  assert.match(textOf(byClass(t, "wl-report-empty")), /当前范围是 \d+ 天/);
+  assert.match(textOf(byClass(t, "wl-report-empty")), /工作周报/);
+});
+
 findByText(renderFresh(tabDef.component), "周报").props.onClick();
 await sleep(80);
 findByText(renderFresh(tabDef.component), "生成周报").props.onClick();
@@ -1133,6 +1143,14 @@ await sleep(80);
 check("切回单日后范围回到今天", () => {
   const t = textOf(renderFresh(tabDef.component));
   assert.ok(!t.includes(monday + " 至 " + DATE), "不应还显示多日范围");
+});
+
+// 单日范围下选周报：允许点，但要说清「本周产出 / 下周安排」会很空
+check("单日范围选周报时给出范围不匹配的提示", () => {
+  const t = renderFresh(tabDef.component);
+  const btn = findByText(t, "周报");
+  assert.ok(!btn.props.disabled, "周报按钮不该被禁用");
+  assert.match(btn.props.title, /当前范围只有 1 天/, "悬停提示应说明周报不适合单日");
 });
 
 check("报告历史入口存在", () => {
@@ -1182,14 +1200,25 @@ check("新增的口吻写进设置", () => {
   assert.equal(saved.customTones[0].id, "t1");
 });
 
-check("报告面板出现自定义口吻按钮", () => {
+check("报告面板把内置口吻做成按钮、自定义口吻收进下拉", () => {
   const t = renderFresh(tabDef.component);
-  assert.ok(findByText(t, "自定义口吻 1"), "实际界面：" + textOf(byClass(t, "wl-report-tabs")));
-  // 口吻栏是独立一行：不跟标题抢宽度，多了也只横向滚动，面板高度不变
   const tabs = byClass(t, "wl-report-tabs");
   assert.ok(tabs, "应有独立的 .wl-report-tabs 行");
-  assert.equal(byClass(byClass(t, "wl-report-head"), "wl-seg-tones"), null, "口吻栏不应再塞进标题行");
-  assert.ok(byClass(tabs, "wl-seg-tones"), "口吻按钮应放在 .wl-seg-tones");
+  assert.equal(byClass(byClass(t, "wl-report-head"), "wl-seg-tones"), null, "口吻栏不应塞进标题行");
+  // 内置三种固定成按钮，数量与文案都不随自定义口吻增长
+  const seg = byClass(tabs, "wl-seg-tones");
+  const labels = [];
+  walk(seg, (n) => {
+    if (n.type === "button") labels.push(textOf(n));
+  });
+  assert.deepEqual(labels, ["日报", "复盘", "周报"], "内置口吻应固定三个按钮");
+  // 自定义口吻走下拉：有几个都能列全，不再横向滚动藏起来
+  const pick = byClass(tabs, "wl-tone-pick");
+  assert.ok(pick, "应给自定义口吻留一个下拉");
+  // 占位文案绝不能拼上数量：用户的口吻常按「自定义口吻 1…N」命名，
+  // 拼了数量就会在切走时显示成「自定义口吻 6」，看着像口吻自己变了。
+  assert.equal(textOf(pick).trim(), "自定义口吻", "占位文案不该拼数量");
+  assert.equal(byClass(tabs, "wl-seg-tones").props.style, undefined, "不应再有横向滚动容器");
 });
 
 check("设置页自定义口吻默认收起", () => {
@@ -1206,13 +1235,58 @@ check("设置页自定义口吻默认收起", () => {
 // 切换范围会清空事实，重新扫一次再生成
 findByText(renderFresh(tabDef.component), "扫描").props.onClick();
 await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 30000);
-findByText(renderFresh(tabDef.component), "自定义口吻 1").props.onClick();
+// 自定义口吻在下拉里：先点开，再从菜单里选
+const toneTrigger = byClass(byClass(renderFresh(tabDef.component), "wl-tone-pick"), "wl-dd-trigger");
+check("自定义口吻下拉可以展开", () => assert.ok(toneTrigger, "应有下拉触发按钮"));
+toneTrigger.props.onClick();
+const toneMenu = byClass(renderKeep(tabDef.component), "wl-dd-menu");
+check("自定义口吻下拉能列出全部自定义口吻", () => {
+  assert.ok(toneMenu, "应弹出下拉菜单");
+  const opts = [];
+  walk(toneMenu, (n) => {
+    if (n.props && n.props.role === "option") opts.push(textOf(n).replace("✓", "").trim());
+  });
+  assert.deepEqual(opts, ["自定义口吻 1"]);
+});
+walk(toneMenu, (n) => {
+  if (n.props && n.props.role === "option") n.props.onClick();
+});
 // 切口吻要先读一次磁盘，等「生成」按钮的文案真的跟着变
 const toneSwitched = await waitFor(
   () => !!findByText(renderFresh(tabDef.component), "生成自定义口吻 1"),
   3000
 );
 check("切到自定义口吻后生成按钮跟着变", () => assert.ok(toneSwitched));
+// 用户的实际操作：选完自定义口吻，再点「日报」——下拉必须回到未选中态。
+// 口吻行里只能有一个高亮；下拉继续显示旧名字会像「还停在自定义口吻上」。
+findByText(renderFresh(tabDef.component), "日报").props.onClick();
+await sleep(200);
+const afterBackToDaily = byClass(byClass(renderFresh(tabDef.component), "wl-tone-pick"), "wl-dd-trigger");
+check("切回日报后自定义下拉回到未选中", () => {
+  assert.ok(afterBackToDaily, "应有口吻下拉");
+  assert.equal(textOf(afterBackToDaily).trim(), "自定义口吻", "应显示占位文案，不能留着刚才那个口吻");
+  assert.ok(byClass(afterBackToDaily, "wl-dd-value").props.className.includes("is-empty"), "应处于空态");
+  assert.equal(byClass(renderFresh(tabDef.component), "wl-tone-pick").props.className.includes("is-current"), false, "停在内置口吻时不应描边");
+});
+// 点「复盘」同理
+findByText(renderFresh(tabDef.component), "复盘").props.onClick();
+await sleep(200);
+check("切到复盘后自定义下拉也回到未选中", () => {
+  const trig = byClass(byClass(renderFresh(tabDef.component), "wl-tone-pick"), "wl-dd-trigger");
+  assert.equal(textOf(trig).trim(), "自定义口吻");
+});
+// 从下拉再切回自定义口吻，仍要能正常生效
+byClass(byClass(renderFresh(tabDef.component), "wl-tone-pick"), "wl-dd-trigger").props.onClick();
+const menuAgain = byClass(renderKeep(tabDef.component), "wl-dd-menu");
+walk(menuAgain, (n) => {
+  if (n.props && n.props.role === "option") n.props.onClick();
+});
+const backToCustom = await waitFor(
+  () => !!findByText(renderFresh(tabDef.component), "生成自定义口吻 1"),
+  3000
+);
+check("从下拉能再切回自定义口吻", () => assert.ok(backToCustom));
+
 const startsBefore = agentStarts.length;
 findByText(renderFresh(tabDef.component), "生成自定义口吻 1").props.onClick();
 const customGenerated = await waitFor(() => agentStarts.length > startsBefore, 10000);
@@ -1228,7 +1302,69 @@ check("设置页明确说明引擎日志只支持 Claude Code", () => {
   assert.match(textOf(renderFresh(settingsDef.component)), /目前只支持 Claude Code/);
 });
 
+// 宿主切页签、热重载都会重新 activate：刚选好的自定义口吻不能被默认口吻顶掉
 dispose2();
+storageData.set("worklog.settings.v1", Object.assign({}, storageData.get("worklog.settings.v1"), { tone: "daily" }));
+const dispose3 = mod.default(ctx);
+await sleep(200);
+const toneAfterReactivate = byClass(byClass(renderFresh(tabDef.component), "wl-tone-pick"), "wl-dd-trigger");
+check("重新激活后仍停在刚才选的自定义口吻", () => {
+  assert.ok(toneAfterReactivate, "应有口吻下拉");
+  assert.match(textOf(toneAfterReactivate), /自定义口吻 1/, "不该退回占位文案");
+  assert.ok(findByText(renderFresh(tabDef.component), "生成自定义口吻 1"), "生成按钮文案应跟着");
+});
+
+// 反过来：用户在设置里改了默认口吻，就该以新默认值为准，而不是一直锁着旧选择
+const savedSettings = Object.assign({}, storageData.get("worklog.settings.v1"));
+storageData.set("worklog.settings.v1", Object.assign({}, savedSettings, { tone: "retro" }));
+dispose3();
+const dispose4 = mod.default(ctx);
+await sleep(200);
+check("改过默认口吻后重新激活按新默认值走", () => {
+  const tabs = byClass(renderFresh(tabDef.component), "wl-report-tabs");
+  const on = [];
+  walk(tabs, (n) => {
+    if (n.type === "button" && n.props.className === "on") on.push(textOf(n));
+  });
+  assert.deepEqual(on, ["复盘"], "应回到新的默认口吻");
+});
+storageData.set("worklog.settings.v1", savedSettings);
+dispose4();
+
+// 引擎运行目录留空时用插件数据目录：生成过程留下的会话记在插件名下，
+// 不会挂到真实项目上被下次扫描当成工作产出。显式设置的值仍优先。
+dispose4();
+storageData.set(
+  "worklog.settings.v1",
+  Object.assign({}, storageData.get("worklog.settings.v1"), { workspacePath: "" })
+);
+const dispose5 = mod.default(ctx);
+await sleep(200);
+findByText(renderFresh(tabDef.component), "扫描").props.onClick();
+await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 30000);
+const startsBeforeDefaultWs = agentStarts.length;
+const genBtnDefaultWs = findByText(renderFresh(tabDef.component), "生成");
+if (genBtnDefaultWs) genBtnDefaultWs.props.onClick();
+await waitFor(() => agentStarts.length > startsBeforeDefaultWs, 10000);
+check("引擎运行目录留空时默认用插件数据目录", () => {
+  const opts = agentStarts[agentStarts.length - 1];
+  assert.ok(opts, "应发起生成");
+  assert.equal(opts.workspacePath, storageDir, "默认应落在插件数据目录，不是当天第一个会话的工作区");
+  assert.notEqual(opts.workspacePath, repoDir, "不能挂到真实项目名下");
+});
+// 只写「插件数据目录」等于没说它在哪：必须把真实路径显示出来
+check("引擎运行目录留空时显示插件数据目录的真实路径", () => {
+  const tree = renderFresh(settingsDef.component);
+  const texts = [];
+  walk(tree, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("is-default")) texts.push(textOf(n));
+  });
+  assert.equal(texts.length, 1, "应有一处默认目录展示");
+  assert.match(texts[0], /默认 · /, "应标明这是默认值而不是用户选的");
+  assert.ok(texts[0].includes(storageDir), "应显示真实路径 " + storageDir);
+});
+dispose5();
 
 /* ------------------------------------------------------------ 汇总 */
 

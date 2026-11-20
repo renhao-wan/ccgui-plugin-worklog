@@ -67,6 +67,28 @@ function isInternalText(text) {
   return INTERNAL_PREFIXES.some((p) => t.startsWith(p));
 }
 
+/**
+ * 插件自己生成报告时留下的会话。
+ *
+ * 宿主执行 agent 会把这一轮也写进会话日志，cwd 正是「引擎运行目录」。
+ * 不排除的话，写日报这件事本身会变成一条「工作产出」：
+ * 生成日报 → 会话里多一条「写日报」→ 下次报告把它写进去 → 越滚越多。
+ * 只认我们自己写死的提示词开头，用户真的要求「写日报」不会被误伤。
+ */
+const GENERATION_PROMPT_PREFIXES = [
+  "你是一位替工程师写工作日报的助手。",
+  "你是一位帮工程师做当日复盘的教练。",
+  "你是一位替工程师写周报的助手。",
+  "你是一位替工程师写工作记录的助手。",
+];
+
+/** 这一整行是否是「插件自己在跑生成」的那一刻。 */
+function isGenerationPrompt(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return GENERATION_PROMPT_PREFIXES.some((p) => t.startsWith(p));
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
@@ -216,6 +238,9 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
 
   let sawAnyMessageBeforeWindow = false;
   let sawAnyMessageInWindow = false;
+  // 这个文件是不是插件自己生成报告留下的：一旦确认就整份丢弃，
+  // 否则「写日报」会被当成一项工作产出写进下一份日报。
+  let isSelfGenerated = false;
   // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对
   let pendingTurns = [];
   // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失
@@ -297,6 +322,12 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
       const joined = textBlocks(content).join("\n").trim();
       if (!joined || isInternalText(joined)) continue;
 
+      // 这一行是插件自己在生成报告：整份会话都不是用户的工作，直接丢弃
+      if (isGenerationPrompt(joined)) {
+        isSelfGenerated = true;
+        break;
+      }
+
       sawAnyMessageInWindow = true;
       s.userTurns++;
       if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;
@@ -377,6 +408,7 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
     // 没有会话 ID 的文件无法追溯，不纳入结果
     return null;
   }
+  if (isSelfGenerated) return null;
   if (!sawAnyMessageInWindow) return null;
 
   s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;

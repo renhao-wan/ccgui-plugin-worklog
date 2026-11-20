@@ -12,6 +12,9 @@ const PLUGIN_ID = "worklog";
 const TAB_KEY = "worklog";
 const PLUGIN_VERSION = "0.1.0";
 const SETTINGS_KEY = "worklog.settings.v1";
+// 用户最后停在哪个口吻。宿主重新激活插件（切页签、热重载）时靠它恢复，
+// 不能让「刚选好的自定义口吻」在回来时退回到默认口吻。
+const VIEW_KEY = "worklog.view.v1";
 const SCAN_REL = "runtime/scan.mjs";
 const REPORTS_DIR = "reports";
 const MAX_PROMPT_CHARS = 20000;
@@ -383,10 +386,14 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-report-head h2 { margin:0; font-size:16px; font-weight:600; flex:none; }
 .wl-report-range { flex:0 1 auto; min-width:0; }
 .wl-report-tabs { display:flex; align-items:center; gap:8px; min-height:32px; }
-/* 口吻按钮排成一行，超出就横向滚动：不换行，面板高度就不会随口吻数量跳 */
-.wl-seg-tones { display:flex; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; max-width:100%; scrollbar-width:none; }
-.wl-seg-tones::-webkit-scrollbar { display:none; }
-.wl-seg-tones button { flex:none; max-width:112px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 内置三个口吻固定成按钮；自定义口吻收进右侧下拉，不再横向滚动。
+ * 横向滚动等于把后面的口吻藏起来——用户根本发现不了，也点不到。 */
+.wl-seg-tones { flex:0 1 auto; min-width:0; }
+.wl-tone-pick { flex:none; width:132px; }
+.wl-tone-pick .wl-dd-trigger { height:30px; padding:0 8px; font-size:12px; border-radius:var(--wl-r-ctl); }
+.wl-tone-pick .wl-dd-value { font-size:12px; }
+/* 下拉里选中的是自定义口吻时，用描边标出来，和左侧按钮的选中态区分开 */
+.wl-tone-pick.is-current .wl-dd-trigger { border-color:var(--wl-accent); color:var(--wl-text); }
 .wl-report-state { margin:0; font-size:12px; color:var(--wl-muted); }
 .wl-report-actions { display:flex; gap:6px; }
 .wl-report-actions .wl-btn { flex:1 1 auto; }
@@ -400,6 +407,10 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   border:1px dashed var(--wl-control); border-radius:8px;
   color:var(--wl-muted); font-size:13px; line-height:1.7;
 }
+.wl-report-empty-inner { min-width:0; }
+/* 范围与口吻不匹配时的说明：不挡生成，只把后果讲清楚 */
+.wl-report-hint { margin:8px 0 0; font-size:12px; line-height:1.6; color:var(--wl-text); }
+.wl-report-hint.is-quiet { color:var(--wl-faint); }
 .wl-report-foot { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .wl-report-foot .wl-spacer { flex:1 1 auto; }
 /* 保存 / 保存中… 的文案长度不同：给一个下限，旁边「复制全文」不会跟着挪 */
@@ -491,6 +502,10 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 .wl-path-value.is-empty { color:var(--wl-muted); }
+/* 没设置时显示的默认路径：虚框表示「这不是你选的，是插件自己的目录」 */
+.wl-path-value.is-default {
+  color:var(--wl-text); border-style:dashed; background:transparent;
+}
 .wl-path-pick { flex:none; height:36px; }
 .wl-path-list { display:flex; flex-direction:column; gap:8px; }
 .wl-path-row { display:flex; align-items:center; gap:8px; min-width:0; }
@@ -945,6 +960,28 @@ async function ensureStorageRoot() {
   return storageRoot;
 }
 
+/**
+ * 生成报告时引擎进程的默认 cwd。
+ *
+ * 用插件自己的数据目录，而不是「当天第一个会话的工作区」：agent 跑一轮会在
+ * ~/.claude/projects 里留下会话记录，cwd 就是这里传的值。挂在真实项目名下，
+ * 「写日报」本身就会被下次扫描当成一项工作产出，越滚越多。
+ * 收到插件目录后，这类会话归在 plugin-data/worklog 下，谁产生的也一眼看得出。
+ * 拿不到目录时返回空串，由调用方回退。
+ */
+async function defaultWorkspace() {
+  if (!appCtx || !appCtx.documentStorage || typeof appCtx.documentStorage.getLocation !== "function") {
+    return "";
+  }
+  try {
+    const root = await ensureStorageRoot();
+    return root;
+  } catch (e) {
+    /* 拿不到就回退到当天第一个会话的工作区 */
+    return "";
+  }
+}
+
 /** 读取当前文档存储位置并同步到界面；切换位置后也要调用它。 */
 async function refreshStorageLocation() {
   if (!appCtx) return null;
@@ -1043,7 +1080,9 @@ async function loadCatalog() {
   if (!appCtx || catalogLoading) return;
   catalogLoading = true;
   try {
-    const ws = String(store.snap.settings.workspacePath || "").trim() || undefined;
+    // 用和生成时同一个 cwd 去查（显式设置 > 插件数据目录），否则下拉里看到的
+    // 引擎可能和真正跑起来的那一套不是同一个环境。
+    const ws = String(store.snap.settings.workspacePath || "").trim() || (await defaultWorkspace()) || undefined;
     const list = await appCtx.agent.catalog(ws);
     set({ catalog: Array.isArray(list) ? list : [], catalogError: "" });
   } catch (e) {
@@ -1630,11 +1669,29 @@ async function switchView(range, mode, extra) {
       extra || {}
     )
   );
+  // 记下最后停在的口吻，重新激活时不会被默认口吻顶掉。
+  // 放在 set 之后立刻做，不等读盘结束——否则切完口吻马上切走页签就会丢。
+  rememberMode(mode);
   const text = await loadReportIntoCache(r, mode);
   // 期间又切了范围或口吻：这批结果已经过期
   if (seq !== reportSwitchSeq) return;
   if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
   showReport(r, mode, text);
+}
+
+/** 记住用户最后停在的口吻。宿主切页签 / 热重载会重新 activate，
+ *  只从 settings.tone 恢复的话，刚选好的自定义口吻会退回默认值。 */
+function rememberMode(mode) {
+  if (!appCtx || !appCtx.storage || typeof appCtx.storage.set !== "function") return;
+  const tone = store.snap.settings ? store.snap.settings.tone : "";
+  try {
+    void appCtx.storage.set(VIEW_KEY, {
+      mode: String(mode || ""),
+      tone: String(tone || ""),
+    });
+  } catch (e) {
+    /* 记不住只影响下次打开，不算失败 */
+  }
 }
 
 async function switchReportMode(mode) {
@@ -1684,6 +1741,30 @@ function toneLabel(mode) {
   const tones = allTones();
   const hit = tones.find((t) => t.id === mode);
   return hit ? hit.label : String(mode || "");
+}
+
+/**
+ * 口吻和当前范围的匹配提示。三种内置口吻的模板是按时间尺度写死的结构
+ * （日报有「今日/明天」、周报有「本周/下周」），范围不匹配时模型只能硬凑。
+ * 不禁用——用户可能就是想用周报看一天；只把后果说清楚。
+ */
+function toneRangeHint(mode, range) {
+  const days = rangeDays(range);
+  if (mode === "weekly" && days <= 1) {
+    return "工作周报按一周组织；当前范围只有 1 天，「本周产出」「下周安排」会很空。";
+  }
+  if (mode === "daily" && days > 1) {
+    return "工作日报按一天写；当前范围是 " + days + " 天，「今日完成」「明天接着做」会变成笼统概括。";
+  }
+  if (mode === "retro" && days > 1) {
+    return "个人复盘原为单日设计；当前范围是 " + days + " 天，会把多天混在一起看。";
+  }
+  return "";
+}
+
+/** 报告空白态的建议口吻：单日推日报/复盘，多日推周报。 */
+function suggestTone(range) {
+  return rangeDays(range) > 1 ? "工作周报" : "工作日报或个人复盘";
 }
 
 /**
@@ -2140,11 +2221,16 @@ async function generateReport() {
 
   try {
     const cfg = store.snap.settings;
-    // 「(未知工作区)」是扫描器的占位符，不能当作真实目录传给引擎
+    // 「(未知工作区)」是扫描器的占位符，不能当作真实目录传给引擎。
+    // 显式设置 > 插件数据目录 > 当天第一个会话的工作区。
+    // 中间这层是默认值：引擎只在它下面跑一轮、不读文件，放插件目录比挂在
+    // 真实项目名下干净——否则「生成日报」这个动作会作为工作产出被下次扫描统计。
     const firstWs = (facts.workspaces || [])
       .map((w) => w && w.workspace)
       .find((w) => w && w !== UNKNOWN_WORKSPACE) || "";
-    const workspacePath = String(cfg.workspacePath || firstWs || "").trim();
+    const workspacePath = String(
+      cfg.workspacePath || (await defaultWorkspace()) || firstWs || ""
+    ).trim();
     if (!workspacePath || workspacePath === UNKNOWN_WORKSPACE) {
       throw new Error("没有可用于运行引擎的工作区，请在设置里选择「引擎运行目录」。");
     }
@@ -3047,6 +3133,13 @@ function ReportPanel() {
   const tones = allTones();
   const currentTone = tones.find((t) => t.id === snap.reportMode);
   const modeShort = currentTone ? currentTone.short : "日报";
+  // 内置口吻走按钮，自定义口吻走下拉；当前停在哪个决定下拉的选中态。
+  // 切到内置口吻后，下拉一律回到「未选中」——口吻行里只有一个高亮，不能两个都像是选中的。
+  const customTones = tones.filter((t) => !t.builtin);
+  const customCurrent = customTones.some((t) => t.id === snap.reportMode);
+  const customPick = customTones.find((t) => t.id === snap.reportMode);
+  // 口吻和范围不匹配时（单日选周报、多日选日报）给一句原因，不禁用
+  const rangeHint = toneRangeHint(snap.reportMode, snap.range);
   const hasReport = !!draft.trim();
   // draft 与 reportSaved 不等说明有改动还没点保存
   const dirty = hasReport && draft !== snap.reportSaved;
@@ -3118,30 +3211,50 @@ function ReportPanel() {
         )
       )
     ),
-    // 口吻单独一行：内置三种 + 自定义都排在这一行里，多了就横向滚动。
-    // 这一行始终存在，切换口吻、新增口吻都不会改变面板的上下结构。
+    // 口吻单独一行：内置三个固定按钮，自定义收进右侧下拉。
+    // 不横向滚动——滚动条一藏，后面的口吻就彻底不可达了。
+    // 这一行高度固定，切换口吻、新增口吻都不会改变面板的上下结构。
     h(
       "div",
       { className: "wl-report-tabs" },
       h(
         "div",
         { className: "wl-seg wl-seg-tones" },
-        tones.map((t) =>
-          h(
-            "button",
-            {
-              key: t.id,
-              className: snap.reportMode === t.id ? "on" : "",
+        tones
+          .filter((t) => t.builtin)
+          .map((t) => {
+            // 悬停就能看到「这个口吻和当前范围合不合适」，点下去依然允许
+            const hint = toneRangeHint(t.id, snap.range);
+            return h(
+              "button",
+              {
+                key: t.id,
+                className: snap.reportMode === t.id ? "on" : "",
+                disabled: snap.generating,
+                title: snap.generating
+                  ? "生成完成后才能切换"
+                  : "切换到" + t.label + (hint ? "\n" + hint : ""),
+                onClick: () => void switchReportMode(t.id),
+              },
+              t.short
+            );
+          })
+      ),
+      // 自定义口吻放在下拉里：有几个都能全部列出来，不用猜右边还有没有东西
+      customTones.length
+        ? h(
+            "div",
+            { className: "wl-tone-pick" + (customCurrent ? " is-current" : "") },
+            h(Dropdown, {
+              items: customTones.map((t) => ({ value: t.id, label: t.label })),
+              // 只有真的停在自定义口吻上才填值；切到内置口吻就回到未选中的占位
+              value: customPick ? customPick.id : "",
+              placeholder: "自定义口吻",
               disabled: snap.generating,
-              title: snap.generating
-                ? "生成完成后才能切换口吻"
-                : "切换到" + t.label + (t.builtin ? "" : "（自定义）"),
-              onClick: () => void switchReportMode(t.id),
-            },
-            t.short
+              onChange: (id) => void switchReportMode(id),
+            })
           )
-        )
-      )
+        : null
     ),
     h(
       "div",
@@ -3190,7 +3303,16 @@ function ReportPanel() {
           : h(
               "div",
               { className: "wl-report-empty" },
-              "扫描后点「生成" + modeShort + "」，模型只依据上面的事实写作；结果会出现在这里。"
+              h(
+                "div",
+                { className: "wl-report-empty-inner" },
+                "扫描后点「生成" + modeShort + "」，模型只依据上面的事实写作；结果会出现在这里。",
+                // 范围与口吻不匹配时说明后果，并给出更合适的选项；不禁用
+                rangeHint ? h("p", { className: "wl-report-hint" }, rangeHint) : null,
+                rangeHint
+                  ? h("p", { className: "wl-report-hint is-quiet" }, "也可以切到：" + suggestTone(snap.range))
+                  : null
+              )
             )
     ),
     // 操作行始终渲染：没有报告时禁用，避免生成前后突然多出/少掉一排按钮。
@@ -3489,6 +3611,8 @@ function Dropdown(props) {
   const itemRefs = R.useRef([]);
 
   const items = props.items || [];
+  // value 既是按钮上显示的内容，也是「真正生效的那个」：两者不再分开。
+  // 空字符串表示未选中，显示 placeholder。
   const value = props.value == null ? "" : String(props.value);
   const selectedIdx = items.findIndex((it) => String(it.value) === value);
   const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
@@ -3979,10 +4103,24 @@ function SettingsSection() {
       onChange: (opts && opts.onChange) || ((v) => patch(key, v)),
     });
 
-  // 引擎运行目录也只读：留空表示用当天第一个会话的工作区
-  const workspaceField = pathField(
-    "workspacePath",
-    "默认：当天第一个会话的工作区",
+  // 引擎运行目录留空表示用插件自己的数据目录。只写「插件数据目录」等于没告诉
+  // 用户它在哪——把真实路径直接显示出来，和生成时实际用的 cwd 是同一个目录。
+  const defaultWorkspacePath = snap.storage && snap.storage.path ? snap.storage.path : "";
+  const workspaceEmpty = h(
+    "span",
+    {
+      className: "wl-path-value" + (defaultWorkspacePath ? " is-default" : " is-empty"),
+      title: defaultWorkspacePath
+        ? "默认值，即插件数据目录：" + displayPath(defaultWorkspacePath)
+        : "正在读取插件数据目录…",
+    },
+    defaultWorkspacePath ? "默认 · " + displayPath(defaultWorkspacePath) : "插件数据目录（正在读取…）"
+  );
+  const workspaceField = h(
+    "div",
+    { className: "wl-path" },
+    form.workspacePath ? pathValue(form.workspacePath, "") : workspaceEmpty,
+    pickButton("workspacePath"),
     resetButton("workspacePath")
   );
 
@@ -4133,7 +4271,7 @@ function SettingsSection() {
         field(
           "引擎运行目录",
           workspaceField,
-          "生成报告时，模型进程在这个目录下运行。报告内容只来自上面的扫描结果，不会读取这里的文件；留空则用当天第一个会话的工作区。"
+          "生成报告时，模型进程在这个目录下运行。报告内容只来自上面的扫描结果，不会读取这里的文件。留空则与「报告保存目录」相同（虚线框显示的就是当前值）——生成过程留下的会话记在自己名下，不会混进你的项目工作里。"
         ),
         field(
           "打开时默认的口吻",
@@ -4244,7 +4382,23 @@ async function bootstrap() {
   const tones = Object.keys(BUILTIN_TONE_LABELS).concat(
     (settings.customTones || []).map((t) => t.id)
   );
-  const mode = tones.includes(settings.tone) ? settings.tone : "daily";
+  // 上次停在哪个口吻优先；settings.tone 只是「默认口吻」，不该盖掉用户当前的选择。
+  // 如果用户后来在设置里改了默认口吻，就以新默认值为准。
+  let remembered = null;
+  try {
+    remembered = await appCtx.storage.get(VIEW_KEY);
+  } catch (e) {
+    remembered = null;
+  }
+  const lastMode = remembered && typeof remembered === "object" ? String(remembered.mode || "") : "";
+  const lastTone = remembered && typeof remembered === "object" ? String(remembered.tone || "") : "";
+  const toneChanged = lastTone && lastTone !== String(settings.tone || "");
+  const mode =
+    lastMode && !toneChanged && tones.includes(lastMode)
+      ? lastMode
+      : tones.includes(settings.tone)
+        ? settings.tone
+        : "daily";
   set({ settings: settings, ready: true, reportMode: mode });
   void loadCatalog();
   void refreshStorageLocation();
