@@ -395,6 +395,16 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 /* 下拉里选中的是自定义口吻时，用描边标出来，和左侧按钮的选中态区分开 */
 .wl-tone-pick.is-current .wl-dd-trigger { border-color:var(--wl-accent); color:var(--wl-text); }
 .wl-report-state { margin:0; font-size:12px; color:var(--wl-muted); }
+/* 生成中的状态行：字色提到正常文本级，前面挂一个呼吸点，和下面流式区呼应。
+ * 圆点用 inline-block 而不是 flex 容器：flex 的高度由内容算，和旁边那行纯文本
+ * 的行高对不齐，会让这一行比别的状态高 2px，面板跟着长高。 */
+.wl-state-live { color:var(--wl-text); }
+.wl-state-live::before {
+  content:""; display:inline-block; vertical-align:.05em; margin-right:6px;
+  width:6px; height:6px; border-radius:50%; background:var(--wl-accent);
+  animation:wl-dot 1.25s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) { .wl-state-live::before { animation:none; opacity:.7; } }
 .wl-report-actions { display:flex; gap:6px; }
 .wl-report-actions .wl-btn { flex:1 1 auto; }
 /* 编辑区高度固定：生成前是占位框，生成中是流式区，生成后是编辑区。
@@ -424,10 +434,46 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   font:inherit; font-size:13px; line-height:1.75;
 }
 .wl-textarea:focus { outline:2px solid var(--wl-accent); outline-offset:-1px; }
+/* 扫光条要画在不会滚动的这一层：内容一长，滚动条会把贴着顶部的绝对定位元素一起卷走，
+ * 恰恰是最需要「还活着」的证据的时候看不见。所以外面加一层只负责描边与裁切。 */
+.wl-stream-box {
+  position:relative; height:340px; box-sizing:border-box; overflow:hidden;
+  border:1px solid var(--wl-border); border-radius:8px; background-color:var(--wl-raised);
+}
 .wl-stream {
-  border:1px solid var(--wl-border); border-radius:8px; background:var(--wl-raised);
-  padding:12px 14px; white-space:pre-wrap; word-break:break-word; box-sizing:border-box;
-  min-height:340px; max-height:340px; overflow:auto; font-size:13px; line-height:1.7;
+  height:100%; box-sizing:border-box; overflow:auto;
+  padding:12px 14px; word-break:break-word;
+  font-size:13px; line-height:1.7;
+}
+.wl-stream-text { white-space:pre-wrap; }
+/* 光标停在最新一个字后面：内容在长、却看不出在动，就是因为缺这个 */
+.wl-caret {
+  display:inline-block; width:2px; height:1.05em; margin-left:2px; vertical-align:-.15em;
+  border-radius:1px; background:var(--wl-accent);
+  animation:wl-caret 1s steps(2,end) infinite;
+}
+@keyframes wl-caret { 0%,100% { opacity:1; } 50% { opacity:0; } }
+/* 首字未到：三点依次呼吸，说明在等模型而不是卡住 */
+.wl-wait { display:flex; align-items:center; gap:9px; color:var(--wl-muted); }
+.wl-dots { display:inline-flex; gap:4px; }
+.wl-dots > i {
+  width:5px; height:5px; border-radius:50%; background:var(--wl-accent);
+  animation:wl-dot 1.25s ease-in-out infinite;
+}
+.wl-dots > i:nth-child(2) { animation-delay:.16s; }
+.wl-dots > i:nth-child(3) { animation-delay:.32s; }
+@keyframes wl-dot { 0%,100% { opacity:.22; transform:scale(.75); } 50% { opacity:1; transform:scale(1); } }
+/* 顶部一条反复扫过的亮带：模型吐字很慢时，也能一眼看出它还活着 */
+.wl-stream-box.is-live::before {
+  content:""; position:absolute; top:0; left:0; z-index:1; width:40%; height:2px;
+  background:linear-gradient(90deg, transparent, var(--wl-accent), transparent);
+  animation:wl-sweep 1.5s ease-in-out infinite;
+}
+@keyframes wl-sweep { from { transform:translateX(-100%); } to { transform:translateX(350%); } }
+@media (prefers-reduced-motion: reduce) {
+  .wl-caret { animation:none; }
+  .wl-dots > i { animation:none; opacity:.6; transform:none; }
+  .wl-stream-box.is-live::before { animation:none; width:100%; opacity:.5; }
 }
 /* Markdown 预览：与编辑区同宽同高，只换内部排版 */
 .wl-md {
@@ -902,6 +948,8 @@ const store = {
     // 报告历史列表：{ rel, key, mode, size, mtime }[]
     reportList: null,
     reportListLoading: false,
+    // 列目录失败的原因；和「确实没有报告」分开，否则一次读盘失败看着像自己没存
+    reportListError: "",
     generating: false,
     streamText: "",
     runId: "",
@@ -1470,7 +1518,7 @@ async function mapLimit(items, limit, fn) {
 async function pruneOldFacts(keepDays) {
   const days = keepDays || 30;
   try {
-    const list = await appCtx.documentStorage.list("runtime/");
+    const list = await listDir("runtime");
     const cutoff = Date.now() - days * 86400000;
     for (const rel of list || []) {
       // 快照名是 facts-<from>.json 或 facts-<from>_<to>.json；多日快照按结束日算年龄
@@ -1589,6 +1637,46 @@ function showReport(range, mode, diskText) {
 }
 
 /**
+ * 列出某个目录下的文件，统一返回「这个目录下的文件名」。
+ *
+ * 宿主 `list(prefix?)` 的语义在不同版本上有出入：有的按目录列，有的按字符串前缀匹配，
+ * 返回值也可能带或不带前缀。更麻烦的是「前缀拼法不对」时可能不报错、只返回空数组，
+ * 那样看着就和「目录里真的没有文件」一样。
+ *
+ * 所以两种拼法都问一遍，先问带尾斜杠的（宿主文档与现有调用都用这种），
+ * 拿不到再问不带斜杠的；两个都空才算是真的空。
+ */
+async function listDir(dir) {
+  const base = String(dir).replace(/[\\/]+$/, "");
+  let lastErr = null;
+  let empty = null;
+  for (const prefix of [base + "/", base]) {
+    let list;
+    try {
+      list = await appCtx.documentStorage.list(prefix);
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    const names = list
+      .map((item) => {
+        // 反斜杠统一成正斜杠后再裁前缀，Windows 宿主两种都可能返回
+        const s = String(item == null ? "" : item).replace(/\\/g, "/");
+        if (s.startsWith(base + "/")) return s.slice(base.length + 1);
+        // 没带前缀（或前缀拼错）就取最后一段，至少不会把目录名混进文件名
+        const cut = s.lastIndexOf("/");
+        return cut >= 0 ? s.slice(cut + 1) : s;
+      })
+      .filter(Boolean);
+    if (names.length) return names;
+    empty = names;
+  }
+  if (empty) return empty;
+  throw lastErr || new Error("无法列出目录 " + base);
+}
+
+/**
  * documentStorage.list(prefix) 返回的路径在不同宿主版本里可能是
  * "reports/x.md.bak"，也可能只是 "x.md.bak"；统一补上目录前缀。
  */
@@ -1611,7 +1699,7 @@ async function removeDoc(rel) {
 async function cleanupReportBaks() {
   if (!appCtx) return;
   try {
-    const list = await appCtx.documentStorage.list(REPORTS_DIR + "/");
+    const list = await listDir(REPORTS_DIR);
     for (const item of list || []) {
       const rel = String(item);
       if (!rel.endsWith(".bak")) continue;
@@ -1838,7 +1926,7 @@ async function loadReportList() {
   const seq = ++reportListSeq;
   set({ reportListLoading: true });
   try {
-    const list = await appCtx.documentStorage.list(REPORTS_DIR + "/");
+    const list = await listDir(REPORTS_DIR);
     const metas = [];
     for (const item of list || []) {
       const rel = String(item || "");
@@ -1863,9 +1951,10 @@ async function loadReportList() {
       }
     }
     if (seq !== reportListSeq) return;
-    set({ reportList: metas });
+    set({ reportList: metas, reportListError: "" });
   } catch (e) {
-    if (seq === reportListSeq) set({ reportList: [] });
+    // 一次都没列出来过 ≠ 真的没有报告。把原因显示出来，别让用户以为是自己没保存。
+    if (seq === reportListSeq) set({ reportList: [], reportListError: safeError(e) });
   } finally {
     if (seq === reportListSeq) set({ reportListLoading: false });
   }
@@ -3260,7 +3349,16 @@ function ReportPanel() {
       "div",
       { className: "wl-report-actions" },
       snap.generating
-        ? h("button", { className: "wl-btn danger block", onClick: () => void stopGenerate() }, "停止")
+        ? h(
+            "button",
+            { className: "wl-btn danger block", onClick: () => void stopGenerate() },
+            h(
+              "span",
+              { className: "wl-btn-inner" },
+              h("span", { className: "wl-spinner" }),
+              "停止"
+            )
+          )
         : h(
             "button",
             { className: "wl-btn primary block", disabled: !canGenerate, onClick: () => void generateReport() },
@@ -3271,7 +3369,12 @@ function ReportPanel() {
       "div",
       { className: "wl-report-state" },
       snap.generating
-        ? "正在生成，可随时停止"
+        ? h(
+            "span",
+            { className: "wl-state-live" },
+            // 状态行也要给出「在动」的证据：字数在涨，是用户最能感知的进度
+            "正在生成" + (snap.streamText ? " · " + snap.streamText.length + " 字符" : "") + "，可随时停止"
+          )
         : hasReport
           ? saveStatus === "saving"
             ? "正在保存… · " + draft.length + " 字符"
@@ -3288,7 +3391,42 @@ function ReportPanel() {
       "div",
       { className: "wl-report-body" },
       snap.generating
-        ? h("div", { className: "wl-stream" }, snap.streamText || "正在等待模型返回…")
+        ? h(
+            // 外层只负责描边、裁切和扫光条：它不滚动，扫光才不会被内容卷走。
+            "div",
+            { className: "wl-stream-box is-live" },
+            h(
+              "div",
+              {
+                className: "wl-stream",
+                // 内容一直在长，视口要跟着走；否则用户盯着的是第一屏。
+                ref: (el) => {
+                  if (el && typeof el.scrollHeight === "number" && el.scrollHeight > el.clientHeight) {
+                    el.scrollTop = el.scrollHeight;
+                  }
+                },
+              },
+              snap.streamText
+                ? h(
+                    "div",
+                    { className: "wl-stream-text" },
+                    snap.streamText,
+                    h("span", { className: "wl-caret", "aria-hidden": "true" })
+                  )
+                : h(
+                    "div",
+                    { className: "wl-wait" },
+                    h(
+                      "span",
+                      { className: "wl-dots", "aria-hidden": "true" },
+                      h("i", { key: "d1" }),
+                      h("i", { key: "d2" }),
+                      h("i", { key: "d3" })
+                    ),
+                    "正在等待模型返回…"
+                  )
+            )
+          )
         : hasReport
           ? viewMode === "preview"
             ? h("div", { className: "wl-md" }, renderMarkdown(draft))
@@ -3461,6 +3599,8 @@ function ReportHistory() {
   const rows = Array.isArray(list) ? list : [];
   const currentKey = rangeKey(snap.range) + "|" + snap.reportMode;
   const busy = snap.generating;
+  // 读取失败和「没有报告」是两件事：前者要说清原因，别让用户以为是自己没保存
+  const listError = snap.reportListError || "";
 
   return h(
     "section",
@@ -3483,13 +3623,17 @@ function ReportHistory() {
         { className: "wl-muted" },
         snap.reportListLoading
           ? "正在读取…"
-          : list
-            ? rows.length + " 份"
-            : "点开查看已保存的报告"
+          : listError
+            ? "读取失败"
+            : list
+              ? rows.length + " 份"
+              : "点开查看已保存的报告"
       )
     ),
     open
-      ? rows.length
+      ? listError
+        ? h("p", { className: "wl-history-empty" }, "读取报告目录失败：" + listError)
+        : rows.length
         ? h(
             "ul",
             { className: "wl-history-list" },

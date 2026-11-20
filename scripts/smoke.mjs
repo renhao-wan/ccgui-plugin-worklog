@@ -997,6 +997,19 @@ tree = renderFresh(tabDef.component);
 findByText(tree, "生成日报").props.onClick();
 const sawStop = await waitFor(() => !!findByText(renderFresh(tabDef.component), "停止"), 3000);
 check("生成过程中出现停止按钮", () => assert.ok(sawStop));
+check("生成中的扫光条挂在不会滚动的外层", () => {
+  const t = renderFresh(tabDef.component);
+  const box = byClass(t, "wl-stream-box");
+  assert.ok(box, "应有流式容器外层");
+  assert.ok(box.props.className.includes("is-live"), "生成中应带 is-live");
+  // 扫光条是绝对定位的伪元素，挂在滚动容器上会被内容卷走
+  const inner = byClass(box, "wl-stream");
+  assert.ok(inner, "外层里应有滚动层");
+  assert.ok(!inner.props.className.includes("is-live"), "is-live 不该落在滚动层上");
+  assert.ok(byClass(t, "wl-caret") || byClass(t, "wl-wait"), "应显示光标或等待三点");
+  // 自动滚动必须挂在真正会滚的那一层
+  assert.equal(typeof inner.props.ref, "function", "滚动 ref 应挂在 wl-stream 上");
+});
 // 等 start 的 Promise resolve，runId 才写进状态；停止要靠它通知宿主
 await sleep(80);
 findByText(renderFresh(tabDef.component), "停止").props.onClick();
@@ -1171,6 +1184,50 @@ check("报告历史按范围与口吻列已保存的报告", () => {
   assert.ok(historyRows.length >= 2, "应有单日与多日两份，实际 " + historyRows.length);
   const texts = historyRows.map((r) => textOf(r));
   assert.ok(texts.some((t) => t.includes(monday + " 至 " + DATE)), "应列出本周这份");
+});
+
+// 宿主 list(prefix) 的两种语义（带/不带尾斜杠、返回带/不带前缀）都要能列出报告。
+// 真实宿主里曾因为拼法与预期不符返回空数组，界面就显示成「还没有保存过报告」。
+const origListImpl = ctx.documentStorage.list;
+const listVariants = {
+  "带尾斜杠 + 带前缀（SDK 文档写法）": (prefix) => origListImpl(prefix),
+  "只给文件名": async (prefix) => (await origListImpl(prefix)).map((p) => p.replace(/^reports\//, "")),
+  "只认不带尾斜杠的前缀": async (prefix) => (String(prefix).endsWith("/") ? [] : origListImpl(prefix + "/")),
+};
+const listVariantResults = [];
+try {
+  for (const [label, impl] of Object.entries(listVariants)) {
+    ctx.documentStorage.list = impl;
+    // 先收起，展开时才会重新读盘（组件只在 open 由假变真时调 loadReportList）
+    findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+    await sleep(150);
+    findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+    // 等读取真正落地：旧行还在，只看 wl-history-list 是否存在会立刻为真，读到的全是上一次的数据
+    await waitFor(() => {
+      const rows = [];
+      walk(renderKeep(tabDef.component), (n) => {
+        const c = n.props && n.props.className;
+        if (typeof c === "string" && c.split(/\s+/).includes("wl-history-row")) rows.push(n);
+      });
+      return rows.length !== historyRows.length;
+    }, 3000);
+    const rows = [];
+    walk(renderKeep(tabDef.component), (n) => {
+      const c = n.props && n.props.className;
+      if (typeof c === "string" && c.split(/\s+/).includes("wl-history-row")) rows.push(n);
+    });
+    listVariantResults.push({ label, n: rows.length });
+  }
+} finally {
+  ctx.documentStorage.list = origListImpl;
+}
+check("宿主 list 语义变化时报告历史仍然读得到", () => {
+  const bad = listVariantResults.filter((r) => r.n < 2);
+  assert.equal(
+    bad.length,
+    0,
+    "下列写法列不出报告：" + bad.map((r) => r.label + "=" + r.n).join("；")
+  );
 });
 
 const weekRow = historyRows.find((r) => textOf(r).includes(monday + " 至 " + DATE));
