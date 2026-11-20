@@ -158,9 +158,16 @@ html.dark .wl-root, .dark .wl-root, html.dark .wl-settings, .dark .wl-settings {
 .wl-muted { color:var(--wl-muted); }
 
 /* ---------- 标题行 ---------- */
-.wl-head { display:flex; flex-direction:column; gap:6px; }
-.wl-head-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.wl-title { margin:0; font-size:24px; font-weight:600; letter-spacing:-.01em; line-height:1.25; }
+/* 标题行只放标题与右侧固定按钮：日期范围另占一行，切换预设时不会把「扫描」挤到下一行 */
+.wl-head { display:flex; flex-direction:column; gap:8px; }
+.wl-head-row { display:flex; align-items:center; gap:10px; flex-wrap:nowrap; }
+.wl-title { margin:0; font-size:24px; font-weight:600; letter-spacing:-.01em; line-height:1.25; flex:none; }
+/* 日期范围与扫描按钮一行：预设固定三项，宽度不随状态变化，右侧按钮不会跳
+ * 「自定义」只多出两个日期框，在日期区内部换行，不把整行挤开。 */
+.wl-head-tools { display:flex; align-items:center; gap:10px; flex-wrap:nowrap; min-height:36px; }
+.wl-head-tools .wl-range { flex:0 1 auto; min-width:0; }
+/* 扫描按钮在「扫描 / 扫描中…」之间切换时宽度不变，右侧按钮不会跟着挪 */
+.wl-btn-scan { min-width:96px; }
 .wl-sub { margin:0; font-size:13px; color:var(--wl-muted); }
 .wl-sub b { font-weight:500; color:var(--wl-text); }
 .wl-spacer { flex:1 1 auto; }
@@ -370,13 +377,35 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   background:var(--wl-surface); padding:16px;
   position:sticky; top:0;
 }
-.wl-report-head { display:flex; align-items:center; gap:8px; }
-.wl-report-head h2 { margin:0; font-size:16px; font-weight:600; }
+/* 头部分两行：第一行固定是标题 + 范围 + 原文/预览，第二行专门放口吻。
+ * 口吻数量变化时只影响第二行内部，上面的东西不会左右挪。 */
+.wl-report-head { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; min-height:28px; }
+.wl-report-head h2 { margin:0; font-size:16px; font-weight:600; flex:none; }
+.wl-report-range { flex:0 1 auto; min-width:0; }
+.wl-report-tabs { display:flex; align-items:center; gap:8px; min-height:32px; }
+/* 口吻按钮排成一行，超出就横向滚动：不换行，面板高度就不会随口吻数量跳 */
+.wl-seg-tones { display:flex; flex-wrap:nowrap; overflow-x:auto; overflow-y:hidden; max-width:100%; scrollbar-width:none; }
+.wl-seg-tones::-webkit-scrollbar { display:none; }
+.wl-seg-tones button { flex:none; max-width:112px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wl-report-state { margin:0; font-size:12px; color:var(--wl-muted); }
 .wl-report-actions { display:flex; gap:6px; }
 .wl-report-actions .wl-btn { flex:1 1 auto; }
+/* 编辑区高度固定：生成前是占位框，生成中是流式区，生成后是编辑区。
+ * 三者公用同一个 340px 的槽位，面板高度不会随着状态切换忽大忽小。 */
+.wl-report-body { min-height:340px; display:flex; flex-direction:column; gap:8px; }
+.wl-report-body > * { flex:1 1 auto; }
+.wl-report-empty {
+  display:flex; align-items:center; justify-content:center; text-align:center;
+  box-sizing:border-box; min-height:340px; padding:24px 20px;
+  border:1px dashed var(--wl-control); border-radius:8px;
+  color:var(--wl-muted); font-size:13px; line-height:1.7;
+}
 .wl-report-foot { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 .wl-report-foot .wl-spacer { flex:1 1 auto; }
+/* 保存 / 保存中… 的文案长度不同：给一个下限，旁边「复制全文」不会跟着挪 */
+.wl-report-foot .wl-btn { min-width:88px; }
+/* 路径留两行高度：目录尚未就绪时是短路径，就绪后变长，面板底部不会突然变矮 */
+.wl-report-path { margin:0; min-height:34px; font-size:12px; color:var(--wl-faint); line-height:1.5; word-break:break-all; }
 .wl-textarea {
   width:100%; min-height:340px; flex:1 1 auto; box-sizing:border-box; resize:vertical;
   border:1px solid var(--wl-control); border-radius:8px;
@@ -386,12 +415,12 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-textarea:focus { outline:2px solid var(--wl-accent); outline-offset:-1px; }
 .wl-stream {
   border:1px solid var(--wl-border); border-radius:8px; background:var(--wl-raised);
-  padding:12px 14px; white-space:pre-wrap; word-break:break-word;
-  max-height:300px; overflow:auto; font-size:13px; line-height:1.7;
+  padding:12px 14px; white-space:pre-wrap; word-break:break-word; box-sizing:border-box;
+  min-height:340px; max-height:340px; overflow:auto; font-size:13px; line-height:1.7;
 }
 /* Markdown 预览：与编辑区同宽同高，只换内部排版 */
 .wl-md {
-  width:100%; min-height:340px; max-height:70vh; flex:1 1 auto; box-sizing:border-box;
+  width:100%; min-height:340px; max-height:340px; flex:1 1 auto; box-sizing:border-box;
   overflow:auto; border:1px solid var(--wl-control); border-radius:8px;
   background:var(--wl-surface); color:var(--wl-text);
   padding:12px 16px; font-size:13px; line-height:1.75; word-break:break-word;
@@ -491,8 +520,6 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-range-inputs { display:inline-flex; align-items:center; gap:6px; }
 .wl-range-sep { font-size:12px; color:var(--wl-muted); }
 .wl-range-note { font-size:12px; color:var(--wl-muted); font-variant-numeric:tabular-nums; }
-.wl-report-range { font-size:12px; color:var(--wl-muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
-.wl-seg-tones { flex-wrap:wrap; }
 
 /* ---------- 报告历史 ---------- */
 .wl-history { border:1px solid var(--wl-border); border-radius:var(--wl-r-card); background:var(--wl-surface); }
@@ -542,14 +569,28 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   padding:1px 4px; border-radius:3px; background:var(--wl-raised);
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
 }
-.wl-tones { display:flex; flex-direction:column; gap:10px; }
+.wl-tones { display:flex; flex-direction:column; gap:8px; }
+/* 每个自定义口吻默认收起：只占一行，模板编辑区要手动点开。
+ * 这样口吻从 0 个加到 6 个，设置页的纵向长度是线性增长的，不会一上来就撑满屏。 */
 .wl-tone-row {
-  display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px;
-  padding:10px 12px; border:1px solid var(--wl-border); border-radius:8px; background:var(--wl-raised);
+  border:1px solid var(--wl-border); border-radius:8px; background:var(--wl-raised);
+  overflow:hidden;
 }
-.wl-tone-name { grid-column:1; }
-.wl-tone-row > .wl-btn { grid-column:2; }
-.wl-tone-prompt { grid-column:1 / -1; min-height:120px; background:var(--wl-surface); }
+.wl-tone-head { display:flex; align-items:center; gap:8px; padding:10px 12px; min-height:44px; cursor:pointer; list-style:none; }
+.wl-tone-head::-webkit-details-marker { display:none; }
+.wl-tone-head:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
+.wl-tone-caret {
+  flex:none; width:7px; height:7px;
+  border-right:1.5px solid var(--wl-muted); border-bottom:1.5px solid var(--wl-muted);
+  transform:rotate(-45deg); transition:transform .15s ease;
+}
+.wl-tone-row[open] > .wl-tone-head .wl-tone-caret { transform:rotate(45deg); }
+.wl-tone-label { flex:1 1 auto; min-width:0; font-size:14px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.wl-tone-hint { flex:none; font-size:12px; color:var(--wl-faint); }
+.wl-tone-head .wl-btn { flex:none; }
+.wl-tone-body { display:flex; flex-direction:column; gap:8px; padding:0 12px 12px; border-top:1px solid var(--wl-rule); padding-top:10px; }
+.wl-tone-name { width:100%; }
+.wl-tone-prompt { min-height:160px; background:var(--wl-surface); }
 
 /* ---------- 窄屏 ---------- */
 @media (max-width: 920px) {
@@ -571,13 +612,17 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   .wl-stat:nth-child(n+3) { border-top:1px solid var(--wl-rule); }
   .wl-track-name { flex-basis:64px; }
   .wl-axis { margin-left:76px; }
-  /* 日期框收窄后，标题、日期、扫描与设置能排成一行 */
+  /* 日期框收窄后，预设、日期、扫描能排在一行。这里一律 nowrap：
+   * 切到「本周」多一行说明、切到「自定义」多两个日期框，都只让控件自己收缩，
+   * 不换行，页头高度就不会随手一换选项就变。 */
   .wl-input[type="date"] { width:120px; }
-  .wl-range { width:100%; }
-  .wl-range .wl-seg { width:100%; }
-  .wl-range .wl-seg button { flex:1 1 0; }
-  .wl-range-inputs { width:100%; }
+  .wl-head-tools .wl-range { flex:1 1 auto; flex-wrap:nowrap; min-width:0; }
+  .wl-range .wl-seg { flex:0 1 auto; min-width:0; }
+  /* 三个预设平分可用宽度，但文字不折行：否则「自定义」会被压成两行，页头又跳高 */
+  .wl-range .wl-seg button { flex:1 1 0; white-space:nowrap; padding:0 6px; }
+  .wl-range-inputs { flex:0 1 auto; min-width:0; }
   .wl-range-inputs .wl-input[type="date"] { flex:1 1 0; width:auto; min-width:0; }
+  .wl-range-note { flex:none; }
   .wl-history-date { min-width:0; }
   .wl-card-meta { margin-left:0; width:100%; }
   .wl-session-head .wl-btn { margin-left:0; }
@@ -606,6 +651,11 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
   .wl-track-name { flex-basis:64px; }
   .wl-axis { margin-left:76px; }
   .wl-input[type="date"] { width:120px; }
+  .wl-head-tools .wl-range { flex:1 1 auto; flex-wrap:nowrap; min-width:0; }
+  .wl-range .wl-seg { flex:0 1 auto; min-width:0; }
+  .wl-range .wl-seg button { flex:1 1 0; white-space:nowrap; padding:0 6px; }
+  .wl-range-inputs { flex:0 1 auto; min-width:0; }
+  .wl-range-inputs .wl-input[type="date"] { flex:1 1 0; width:auto; min-width:0; }
   .wl-card-meta { margin-left:0; width:100%; }
   .wl-session-head .wl-btn { margin-left:0; }
   .wl-report { order:-1; }
@@ -3066,7 +3116,13 @@ function ReportPanel() {
           },
           "预览"
         )
-      ),
+      )
+    ),
+    // 口吻单独一行：内置三种 + 自定义都排在这一行里，多了就横向滚动。
+    // 这一行始终存在，切换口吻、新增口吻都不会改变面板的上下结构。
+    h(
+      "div",
+      { className: "wl-report-tabs" },
       h(
         "div",
         { className: "wl-seg wl-seg-tones" },
@@ -3113,55 +3169,59 @@ function ReportPanel() {
                 : "已保存 · " + draft.length + " 字符"
           : "尚未生成"
     ),
-    snap.generating
-      ? h("div", { className: "wl-stream" }, snap.streamText || "正在等待模型返回…")
-      : null,
-    !snap.generating && !hasReport
-      ? h("p", { className: "wl-report-state" }, "扫描后点「生成" + modeShort + "」，模型只依据上面的事实写作。")
-      : null,
-    !snap.generating && hasReport
-      ? viewMode === "preview"
-        ? h("div", { className: "wl-md" }, renderMarkdown(draft))
-        : h("textarea", {
-            className: "wl-textarea",
-            value: draft,
-            spellCheck: false,
-            onChange: (e) => setDraft(e.target.value),
-            onBlur: commit,
-            placeholder: "报告会出现在这里，可以直接修改。",
-          })
-      : null,
-    hasReport
-      ? h(
-          "div",
-          { className: "wl-report-foot" },
-          h(
-            "button",
-            {
-              className: "wl-btn",
-              title: "保存到 " + reportAbs,
-              disabled: saveStatus === "saving" || snap.generating,
-              onClick: () => saveNow(),
-            },
-            saveStatus === "saving" ? "保存中…" : "保存"
-          ),
-          h(
-            "button",
-            {
-              className: "wl-btn",
-              title: "复制报告全文到系统剪贴板",
-              onClick: () => {
-                commit();
-                void copyReport();
-              },
-            },
-            "复制全文"
-          )
-        )
-      : null,
-    hasReport
-      ? h("p", { className: "wl-report-state", title: reportAbs }, "点「保存」后写入 " + reportAbs)
-      : null
+    // 编辑区固定成一个槽位：生成前占位、生成中流式、生成后编辑器，
+    // 三种状态换的都是槽位里的内容，面板高度与下方按钮位置不变。
+    h(
+      "div",
+      { className: "wl-report-body" },
+      snap.generating
+        ? h("div", { className: "wl-stream" }, snap.streamText || "正在等待模型返回…")
+        : hasReport
+          ? viewMode === "preview"
+            ? h("div", { className: "wl-md" }, renderMarkdown(draft))
+            : h("textarea", {
+                className: "wl-textarea",
+                value: draft,
+                spellCheck: false,
+                onChange: (e) => setDraft(e.target.value),
+                onBlur: commit,
+                placeholder: "报告会出现在这里，可以直接修改。",
+              })
+          : h(
+              "div",
+              { className: "wl-report-empty" },
+              "扫描后点「生成" + modeShort + "」，模型只依据上面的事实写作；结果会出现在这里。"
+            )
+    ),
+    // 操作行始终渲染：没有报告时禁用，避免生成前后突然多出/少掉一排按钮。
+    h(
+      "div",
+      { className: "wl-report-foot" },
+      h(
+        "button",
+        {
+          className: "wl-btn",
+          title: "保存到 " + reportAbs,
+          disabled: !hasReport || saveStatus === "saving" || snap.generating,
+          onClick: () => saveNow(),
+        },
+        saveStatus === "saving" ? "保存中…" : "保存"
+      ),
+      h(
+        "button",
+        {
+          className: "wl-btn",
+          title: "复制报告全文到系统剪贴板",
+          disabled: !hasReport,
+          onClick: () => {
+            commit();
+            void copyReport();
+          },
+        },
+        "复制全文"
+      )
+    ),
+    h("p", { className: "wl-report-path", title: reportAbs }, "写入 " + reportAbs)
   );
 }
 
@@ -3362,19 +3422,24 @@ function CenterTab() {
           { className: "wl-head-row" },
           h("h1", { className: "wl-title" }, "工作志"),
           h("span", { className: "wl-spacer" }),
+          h("button", { className: "wl-btn ghost", onClick: () => openSettings() }, "设置")
+        ),
+        h(
+          "div",
+          { className: "wl-head-tools" },
           h(RangePicker),
+          h("span", { className: "wl-spacer" }),
           h(
             "button",
             {
-              className: "wl-btn",
+              className: "wl-btn wl-btn-scan",
               disabled: snap.scanning || snap.rechecking || snap.generating,
               onClick: () => void doScan(),
             },
             snap.scanning
               ? h("span", { className: "wl-btn-inner" }, h("span", { className: "wl-spinner" }), "扫描中…")
               : "扫描"
-          ),
-          h("button", { className: "wl-btn ghost", onClick: () => openSettings() }, "设置")
+          )
         ),
         h("p", { className: "wl-sub" }, headSub(snap, facts))
       ),
@@ -3811,30 +3876,50 @@ function SettingsSection() {
     customTones.length
       ? customTones.map((t, i) =>
           h(
-            "div",
+            "details",
             { className: "wl-tone-row", key: t.id },
-            h("input", {
-              className: "wl-input wl-tone-name",
-              value: t.label || "",
-              maxLength: MAX_TONE_LABEL,
-              placeholder: "口吻名称，例如：周会发言稿",
-              onChange: (e) => patchTone(i, "label", e.target.value),
-            }),
-            h("button", {
-              type: "button",
-              className: "wl-btn ghost",
-              title: "删除这个口吻（已保存的报告文件不会删除）",
-              onClick: () => removeTone(i),
-            }, "删除"),
-            h("textarea", {
-              className: "wl-textarea wl-tone-prompt",
-              value: t.prompt || "",
-              // 与 sanitizeCustomTones 的上限一致：否则粘贴超长模板会「保存成功但内容变短」
-              maxLength: MAX_TONE_PROMPT,
-              spellCheck: false,
-              placeholder: "给模型的写作要求。用 <日期> 代表当前范围。",
-              onChange: (e) => patchTone(i, "prompt", e.target.value),
-            })
+            h(
+              "summary",
+              { className: "wl-tone-head" },
+              h("span", { className: "wl-tone-caret", "aria-hidden": "true" }),
+              h("span", { className: "wl-tone-label" }, t.label || "未命名口吻"),
+              h("span", { className: "wl-tone-hint" }, "编辑模板"),
+              h(
+                "button",
+                {
+                  type: "button",
+                  className: "wl-btn ghost",
+                  title: "删除这个口吻（已保存的报告文件不会删除）",
+                  onClick: (e) => {
+                    // 不阻止冒泡的话点删除会顺带把这一行展开
+                    e.preventDefault();
+                    e.stopPropagation();
+                    removeTone(i);
+                  },
+                },
+                "删除"
+              )
+            ),
+            h(
+              "div",
+              { className: "wl-tone-body" },
+              h("input", {
+                className: "wl-input wl-tone-name",
+                value: t.label || "",
+                maxLength: MAX_TONE_LABEL,
+                placeholder: "口吻名称，例如：周会发言稿",
+                onChange: (e) => patchTone(i, "label", e.target.value),
+              }),
+              h("textarea", {
+                className: "wl-textarea wl-tone-prompt",
+                value: t.prompt || "",
+                // 与 sanitizeCustomTones 的上限一致：否则粘贴超长模板会「保存成功但内容变短」
+                maxLength: MAX_TONE_PROMPT,
+                spellCheck: false,
+                placeholder: "给模型的写作要求。用 <日期> 代表当前范围。",
+                onChange: (e) => patchTone(i, "prompt", e.target.value),
+              })
+            )
           )
         )
       : h("span", { className: "wl-path-value is-empty" }, "还没有自定义口吻"),

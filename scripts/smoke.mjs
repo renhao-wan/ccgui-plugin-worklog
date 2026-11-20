@@ -551,6 +551,16 @@ check("跳回原会话带上 engine/sessionId/workspace", () => {
 
 // 生成日报
 tree = renderFresh(tabDef.component);
+check("报告区三种状态共用同一个槽位", () => {
+  // 没有报告时：占位框 + 禁用的保存按钮，结构已经就位，
+  // 生成完成后换的只是槽位里的内容，面板高度与下方按钮位置不变
+  const body = byClass(tree, "wl-report-body");
+  assert.ok(body, "应有 .wl-report-body");
+  assert.ok(byClass(body, "wl-report-empty"), "空态应放在槽位里");
+  const foot = byClass(tree, "wl-report-foot");
+  assert.ok(foot, "操作行应始终存在");
+  assert.equal(findByText(foot, "保存").props.disabled, true, "没有报告时保存应禁用");
+});
 const genBtn = findByText(tree, "生成日报");
 check("生成前按钮可用", () => assert.equal(genBtn.props.disabled, false));
 genBtn.props.onClick();
@@ -1174,7 +1184,23 @@ check("新增的口吻写进设置", () => {
 
 check("报告面板出现自定义口吻按钮", () => {
   const t = renderFresh(tabDef.component);
-  assert.ok(findByText(t, "自定义口吻 1"), "实际界面：" + textOf(byClass(t, "wl-report-head")));
+  assert.ok(findByText(t, "自定义口吻 1"), "实际界面：" + textOf(byClass(t, "wl-report-tabs")));
+  // 口吻栏是独立一行：不跟标题抢宽度，多了也只横向滚动，面板高度不变
+  const tabs = byClass(t, "wl-report-tabs");
+  assert.ok(tabs, "应有独立的 .wl-report-tabs 行");
+  assert.equal(byClass(byClass(t, "wl-report-head"), "wl-seg-tones"), null, "口吻栏不应再塞进标题行");
+  assert.ok(byClass(tabs, "wl-seg-tones"), "口吻按钮应放在 .wl-seg-tones");
+});
+
+check("设置页自定义口吻默认收起", () => {
+  const row = byClass(renderFresh(settingsDef.component), "wl-tone-row");
+  assert.ok(row, "应有自定义口吻行");
+  assert.equal(row.type, "details");
+  assert.ok(!row.props.open, "默认不应展开");
+  const body = byClass(row, "wl-tone-body");
+  assert.ok(body, "模板编辑区应在 <details> 里");
+  assert.ok(byClass(row, "wl-tone-head"), "summary 行应显示名称");
+  assert.match(textOf(byClass(row, "wl-tone-head")), /自定义口吻 1/);
 });
 
 // 切换范围会清空事实，重新扫一次再生成
