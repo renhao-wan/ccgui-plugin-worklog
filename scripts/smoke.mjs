@@ -88,10 +88,26 @@ function makeFixture() {
 makeFixture();
 
 /* ------------------------------------------------------------ DOM 替身 */
-// 插件只用到 document.addEventListener/removeEventListener（浮层的 Esc 关闭）。
+// 插件只用到 document.addEventListener/removeEventListener（浮层的 Esc 与焦点陷阱）。
 // 给一个最小实现，能验证「注册了、关掉时解绑了」这件事本身。
 const docListeners = new Map();
+// 会话源目录的内容指纹：用来验证「扫描不写源目录」这件事本身，
+// 而不是只数一数调用了几次 node。
+function sessionTreeFingerprint() {
+  const out = {};
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else out[p] = fs.readFileSync(p, "utf8") + "|" + fs.statSync(p).mtimeMs;
+    }
+  };
+  walk(sessionRoot);
+  return JSON.stringify(out);
+}
+let sessionFingerprintBeforeScan = "";
 globalThis.document = {
+  activeElement: null,
   addEventListener: (type, fn) => {
     if (!docListeners.has(type)) docListeners.set(type, new Set());
     docListeners.get(type).add(fn);
@@ -356,8 +372,15 @@ const ctx = {
       if (!fs.existsSync(p)) return null;
       return { content: fs.readFileSync(p, "utf8"), version: String(fs.statSync(p).mtimeMs) };
     },
-    writeTextAtomic: async (rel, content) => {
+    writeTextAtomic: async (rel, content, expectedVersion) => {
       const p = path.join(docLocation.path, rel);
+      // 保真 CAS：版本对不上就拒绝，否则插件的冲突分支永远测不到。
+      // 宿主语义：expectedVersion 为 null/undefined 表示「覆盖或不要求」，
+      // 有值时必须与当前文件版本一致。
+      if (expectedVersion != null && fs.existsSync(p)) {
+        const cur = String(fs.statSync(p).mtimeMs);
+        if (cur !== String(expectedVersion)) throw new Error("version conflict");
+      }
       fs.mkdirSync(path.dirname(p), { recursive: true });
       // 模拟宿主原子写入前留一份 .bak
       if (fs.existsSync(p)) fs.writeFileSync(p + ".bak", fs.readFileSync(p));
@@ -534,6 +557,7 @@ check("页面初始为空态并给出说明", () => {
   assert.match(textOf(tree), /还没有扫描/);
 });
 
+sessionFingerprintBeforeScan = sessionTreeFingerprint();
 scanButton.props.onClick();
 const scanned = await waitFor(() => {
   const t = textOf(renderFresh(tabDef.component));
@@ -569,6 +593,16 @@ check("扫描调用的是 node，且只读源目录", () => {
   assert.ok(nodeCalls.length >= 1);
   const gitCalls = execCalls.filter((c) => c.bin === "git");
   assert.ok(gitCalls.length >= 1);
+  // 「只读」不是数调用次数，而是源目录一个字节都没变
+  assert.equal(sessionTreeFingerprint(), sessionFingerprintBeforeScan, "扫描不应改动会话源目录");
+  // 扫描器的输出目录必须在插件数据目录下，不能落在会话源目录里
+  const scanCall = nodeCalls.find((c) => c.args.some((a) => String(a).endsWith("scan.mjs")));
+  assert.ok(scanCall, "应调用扫描器脚本");
+  const outIdx = scanCall.args.indexOf("--out");
+  assert.ok(outIdx >= 0, "扫描器应写结果文件");
+  const outPath = String(scanCall.args[outIdx + 1]);
+  assert.equal(path.resolve(outPath).startsWith(path.resolve(sessionRoot)), false, "结果文件不应写进会话源目录");
+  assert.ok(path.resolve(outPath).startsWith(path.resolve(storageDir)), "结果文件应落在插件数据目录");
 });
 
 // 扫描器升级与事实快照清理是异步尾巴，等它落地再断言

@@ -18,7 +18,6 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 
 const MAX_USER_MESSAGES_PER_SESSION = 80;
 const MAX_USER_TEXT = 800;
@@ -32,6 +31,11 @@ const MAX_TURN_USER_TEXT = 500;
 const MAX_TURN_REPLY_TEXT = 300;
 // 用户连续发言、助手还没回应时先排队的上限
 const MAX_PENDING_TURNS = 5;
+// 资源上限：会话日志可能被巨型附件撑到几百 MB。超限的文件与单行直接跳过，
+// 并在 failures 里说明，免得整次扫描被一个坏文件拖垮。
+const MAX_SESSION_FILE_MB = 512;
+const MAX_FILES_PER_SCAN = 4000;
+const MAX_LINE_CHARS = 32 * 1024 * 1024;
 
 /** 内部注入的消息特征：这些不是用户真正输入的内容。
  *  只列已知标签，不用裸 "<" 兜底——用户会粘贴 HTML/XML/JSX，
@@ -126,6 +130,7 @@ function collectFiles(dir, sinceMs, out) {
     return out;
   }
   for (const e of entries) {
+    if (out.length >= MAX_FILES_PER_SCAN) return out;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) {
       collectFiles(p, sinceMs, out);
@@ -209,7 +214,43 @@ function resolveAdapter(name) {
   return Object.prototype.hasOwnProperty.call(ADAPTERS, key) ? ADAPTERS[key] : null;
 }
 
+/** 按行读文件，单行超长时跳过但继续。
+ *
+ *  readline 遇到超长行会把整行缓存在内存里：一条几 GB 的附件行足以把扫描
+ *  进程撑爆。这里自己切分，跳过期间也不保留数据，内存只与 chunk 大小有关。 */
+async function* readLinesBounded(filePath, maxLine) {
+  const stream = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1 << 16 });
+  let buf = "";
+  let skipping = false;
+  for await (const chunk of stream) {
+    if (skipping) {
+      const nl = chunk.indexOf("\n");
+      if (nl < 0) continue; // 这一块仍然属于被丢弃的那行
+      skipping = false;
+      buf = chunk.slice(nl + 1);
+    } else {
+      buf += chunk;
+    }
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (line.length <= maxLine) yield line;
+    }
+    if (buf.length > maxLine) {
+      // 还没有换行就已经超长：丢弃这一行剩余部分
+      buf = "";
+      skipping = true;
+    }
+  }
+  if (!skipping && buf && buf.length <= maxLine) yield buf;
+}
+
 async function scanSessionFile(file, windowStart, windowEnd, adapter) {
+  if (file.size > MAX_SESSION_FILE_MB * 1048576) {
+    throw new Error("会话文件 " + path.basename(file.p) + " 超过 " + MAX_SESSION_FILE_MB + "MB，已跳过");
+  }
+
   const s = {
     sessionId: null,
     engine: adapter.id,
@@ -227,31 +268,30 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
     userMessages: [],
     turns: [],
     finalAssistantText: "",
-    tools: {},
+    // 工具名来自 JSONL，是外部输入：普通对象上 "constructor"/"__proto__"
+    // 会命中原型链或被静默忽略，计数变字符串或直接丢失。
+    tools: Object.create(null),
     toolErrors: [],
     editedFiles: new Set(),
-    fileEditCounts: {},
+    fileEditCounts: Object.create(null),
     commands: [],
-    hours: {},
+    hours: Object.create(null),
     sidechainTurns: 0,
   };
 
   let sawAnyMessageBeforeWindow = false;
   let sawAnyMessageInWindow = false;
-  // 这个文件是不是插件自己生成报告留下的：一旦确认就整份丢弃，
-  // 否则「写日报」会被当成一项工作产出写进下一份日报。
+  // 这个文件是不是插件自己生成报告留下的：只有「整份会话的第一条真实用户消息
+  // 就是我们的提示词」才算。用户只是把提示词粘进真实会话里讨论时，那一行按
+  // 内部注入跳过，不能把整份会话一起丢掉。
   let isSelfGenerated = false;
+  let sawAnyRealUserMessage = false;
   // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对
   let pendingTurns = [];
   // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失
   let carryTurn = null;
 
-  const rl = readline.createInterface({
-    input: fs.createReadStream(file.p, { encoding: "utf8" }),
-    crlfDelay: Infinity,
-  });
-
-  for await (const line of rl) {
+  for await (const line of readLinesBounded(file.p, MAX_LINE_CHARS)) {
     if (!line || line.length < 2) continue;
     let o;
     try {
@@ -279,6 +319,8 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
         if (early && !isToolResult(early)) {
           const text = textBlocks(early).join("\n").trim();
           if (text && !isInternalText(text)) {
+            // 窗口之前就有过真实用户消息：这份文件不是插件自己生成报告留下的
+            if (!isGenerationPrompt(text)) sawAnyRealUserMessage = true;
             carryTurn = {
               ts: tsRaw,
               user: clip(text, MAX_TURN_USER_TEXT),
@@ -322,11 +364,17 @@ async function scanSessionFile(file, windowStart, windowEnd, adapter) {
       const joined = textBlocks(content).join("\n").trim();
       if (!joined || isInternalText(joined)) continue;
 
-      // 这一行是插件自己在生成报告：整份会话都不是用户的工作，直接丢弃
+      // 这一行是插件自己在生成报告：只有「整份会话的第一条真实用户消息就是
+      // 我们的提示词」才认定整份丢弃。用户把提示词粘进自己的会话里讨论时，
+      // 那只是其中一条消息，跳过它就好，不能把当天的真实工作一起吞掉。
       if (isGenerationPrompt(joined)) {
-        isSelfGenerated = true;
-        break;
+        if (!sawAnyRealUserMessage) {
+          isSelfGenerated = true;
+          break;
+        }
+        continue;
       }
+      sawAnyRealUserMessage = true;
 
       sawAnyMessageInWindow = true;
       s.userTurns++;
@@ -430,7 +478,7 @@ function groupByWorkspace(sessions) {
   for (const s of sessions) {
     const key = s.workspace || "(未知工作区)";
     if (!map.has(key)) {
-      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: {}, userTurns: 0 });
+      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: Object.create(null), userTurns: 0 });
     }
     const g = map.get(key);
     g.sessions.push(s.sessionId);

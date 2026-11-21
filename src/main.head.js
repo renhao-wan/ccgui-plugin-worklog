@@ -632,6 +632,10 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-history-del:focus-visible { opacity:1; }
 .wl-history-del:hover:not(:disabled) { color:var(--wl-negative); }
 .wl-history-del:disabled { opacity:.4; cursor:not-allowed; }
+/* 触屏没有 hover：删除入口必须常显，否则在平板上根本找不到它 */
+@media (hover: none) {
+  .wl-history-del { opacity:.75; }
+}
 /* 已经点过一次、等待确认：常显 + 红色，让「再点一次就没了」足够清楚 */
 .wl-history-del.is-confirm {
   opacity:1; color:var(--wl-neg-ink); background:var(--wl-neg-bg); font-weight:500;
@@ -1356,6 +1360,10 @@ async function loadFactsSnapshot(range) {
     return null;
   }
   if (!facts || typeof facts !== "object" || !facts.totals) return null;
+  // 快照是本机文件，可能被手改或半写：渲染期直接 slice/entries 会抛错，
+  // 没有错误边界就是整页白屏。结构性字段不对就当没有快照。
+  if (!Array.isArray(facts.sessions) || !Array.isArray(facts.workspaces)) return null;
+  if (!Array.isArray(facts.failures)) facts.failures = [];
   // 快照可能来自另一个扫描引擎版本：认不出来就当没有
   if (facts.engine && facts.engine !== SCAN_ENGINE_ID) return null;
   if (facts.range && (facts.range.from !== normalizeRange(range).from || facts.range.to !== normalizeRange(range).to)) {
@@ -1599,13 +1607,77 @@ function relToBase(base, filePath) {
   return isAbs ? "" : b;
 }
 
+/* git status --porcelain 的路径转义表：quotepath=false 时只有引号包裹的
+ * 路径会带 C 风格转义（\n、\t、\303\251 这种八进制字节）。不解码就会
+ * 和会话里记的真实路径对不上，对账时误报「git 里看不到」。 */
+function unquoteGitPath(p) {
+  if (!/^"(.*)"$/s.test(p)) return p;
+  const body = p.slice(1, -1);
+  let out = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === undefined) {
+      out += "\\";
+      break;
+    }
+    if (/[0-7]/.test(next)) {
+      // 八进制字节串按 UTF-8 还原：git 用 \303\251 表示 é
+      let oct = "";
+      let j = i + 1;
+      while (j < body.length && oct.length < 3 && /[0-7]/.test(body[j])) {
+        oct += body[j];
+        j += 1;
+      }
+      const byte = Number.parseInt(oct, 8);
+      if (byte >= 0x80) {
+        // 收集连续的八进制字节后统一解码，避免逐个解码出错
+        const bytes = [byte];
+        let k = j;
+        while (k + 3 < body.length && body[k] === "\\" && /[0-7]/.test(body[k + 1])) {
+          let o2 = "";
+          let m = k + 1;
+          while (m < body.length && o2.length < 3 && /[0-7]/.test(body[m])) {
+            o2 += body[m];
+            m += 1;
+          }
+          const b2 = Number.parseInt(o2, 8);
+          if (b2 < 0x80) break;
+          bytes.push(b2);
+          k = m;
+        }
+        try {
+          out += new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
+          i = k - 1;
+          continue;
+        } catch (e) {
+          out += String.fromCharCode(byte);
+          i = j - 1;
+          continue;
+        }
+      }
+      out += String.fromCharCode(byte);
+      i = j - 1;
+      continue;
+    }
+    const map = { n: "\n", t: "\t", r: "\r", '"': '"', "\\": "\\", a: "\x07", b: "\b", f: "\f", v: "\v" };
+    out += Object.prototype.hasOwnProperty.call(map, next) ? map[next] : next;
+    i += 1;
+  }
+  return out;
+}
+
 /** git status --porcelain 的行尾路径：重命名是 "old -> new"，对账只关心当前路径。 */
 function statusPath(text) {
   const raw = String(text || "").trim();
   const arrow = raw.lastIndexOf(" -> ");
   const p = arrow >= 0 ? raw.slice(arrow + 4) : raw;
-  // 带空格/特殊字符的路径会被整体加引号
-  return p.replace(/^"(.*)"$/, "$1").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  // 带空格/特殊字符的路径会被整体加引号，里面可能是 C 风格转义
+  return unquoteGitPath(p);
 }
 
 /**
@@ -1698,10 +1770,16 @@ async function pruneOldFacts(keepDays) {
   }
 }
 
-/** 扫完之后跑 git 对账并更新 store。抽出来给 doScan 和快照恢复后的补核对共用。 */
+/** 扫完之后跑 git 对账并更新 store。抽出来给 doScan 和快照恢复后的补核对共用。
+ *
+ *  同一时刻只允许一轮对账在跑：调用方有三处（扫描、快照恢复、切换范围），
+ *  没有轮次标记时，先发起的旧一轮后返回会把新范围的结果盖掉，还会提前把
+ *  rechecking 清成 false，让「扫描」按钮在真正核对完成前就可点。 */
+let gitRound = 0;
 async function reconcileGit(facts, range) {
   if (!store.snap.settings.gitReconcile || !facts.workspaces || !facts.workspaces.length) return;
   const key = rangeKey(range);
+  const round = ++gitRound;
   set({ rechecking: true });
   const groups = facts.workspaces.filter(
     (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
@@ -1717,6 +1795,7 @@ async function reconcileGit(facts, range) {
       error: safeError(e),
     }))
   );
+  if (round !== gitRound) return; // 已经有更新的一轮接手，连 rechecking 都不该由这轮复位
   if (rangeKey(store.snap.range) !== key) {
     // 结果属于旧范围：丢弃。但 rechecking 要收回来——扫描按钮的 disabled
     // 里有它，留着不放会让按钮一直点不动。
@@ -1731,6 +1810,12 @@ async function doScan() {
   const range = normalizeRange(store.snap.range);
   const key = rangeKey(range);
   const mode = store.snap.reportMode;
+  // 上限只在这里统一拦：日期框之外，历史报告的文件名、手改过的快照
+  // 都可能带进任意跨度，而那些路径不经过 changeRangeDraft。
+  if (rangeDays(range) > MAX_RANGE_DAYS) {
+    set({ error: "一次最多看 " + MAX_RANGE_DAYS + " 天，当前范围是 " + rangeDays(range) + " 天。请缩小区间再扫描。" });
+    return;
+  }
   // 扫描不丢编辑中的草稿：先记进内存，扫描完再放回编辑区
   stashReportDraft();
   set({ scanning: true, error: "", toast: "", facts: null, git: null, streamText: "" });
@@ -1748,9 +1833,15 @@ async function doScan() {
     if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
     showReport(range, mode, saved);
   } catch (e) {
-    set({ error: "扫描失败：" + safeError(e) });
+    // 范围已经变了：这一轮的错误属于旧范围，别挂到用户正在看的范围上
+    if (rangeKey(store.snap.range) === key) set({ error: "扫描失败：" + safeError(e) });
   } finally {
-    set({ scanning: false, rechecking: false });
+    // 只有仍是当前这一轮才复位；晚到的旧轮次不能把新轮次的 spinner 关掉
+    if (rangeKey(store.snap.range) === key) set({ scanning: false, rechecking: false });
+    else set({ scanning: false });
+    // 扫描期间切了范围：changeRange 里的 restoreFactsFor 因 scanning 跳过了，
+    // 这里补一次，否则明明扫过的范围会一直显示「还没有扫描」。
+    if (rangeKey(store.snap.range) !== key) void restoreFactsFor(store.snap.range);
   }
 }
 
@@ -1807,12 +1898,18 @@ function persistDraftsSoon() {
   if (draftSaveTimer) clearTimeout(draftSaveTimer);
   draftSaveTimer = setTimeout(() => {
     draftSaveTimer = null;
-    try {
-      void Promise.resolve(appCtx.storage.set(DRAFTS_KEY, draftPayload())).catch(() => {});
-    } catch (e) {
-      /* 存不下只影响下次启动能否恢复，不影响当前编辑 */
-    }
+    flushDraftsNow();
   }, DRAFT_PERSIST_DELAY_MS);
+}
+
+/** 立刻落一次草稿（不等防抖）。卸载时要用：定时器醒来时 appCtx 已经是 null。 */
+function flushDraftsNow() {
+  if (!appCtx || !appCtx.storage || typeof appCtx.storage.set !== "function") return;
+  try {
+    void Promise.resolve(appCtx.storage.set(DRAFTS_KEY, draftPayload())).catch(() => {});
+  } catch (e) {
+    /* 存不下只影响下次启动能否恢复，不影响当前编辑 */
+  }
 }
 
 /** 启动时把上次没保存的草稿读回来。读失败就当作没有草稿，不能拦住启动。 */
@@ -1857,10 +1954,36 @@ function stashReportDraft() {
   persistDraftsSoon();
 }
 
+/* 编辑区（ReportPanel 的 textarea）里最新的文本。
+ * 组件状态对外不可见，而切口吻、扫描、卸载这些模块级动作用的是 store。
+ * 用户没 blur 就点按钮时，store 里还是上一版——必须先把这份交回去。 */
+let editorDraft = null;
+let editorDraftKey = "";
+
+function noteEditorDraft(viewKey, text) {
+  editorDraft = text;
+  editorDraftKey = viewKey;
+}
+
+/** 把编辑区的最新文本交回 store（只在它确实属于当前视图时）。 */
+function commitEditorDraft() {
+  if (editorDraft === null) return;
+  if (editorDraftKey !== REPORT_KEY(store.snap.range, store.snap.reportMode)) return;
+  if (store.snap.report !== editorDraft) set({ report: editorDraft });
+}
+
+/** 磁盘缓存被我们自己的保存更新过几次。读盘期间发生过写入时，
+ *  读回来的旧内容不能覆盖缓存里刚写进去的新版本。 */
+let diskWriteSeq = 0;
+
 /** 读磁盘内容并更新缓存，返回文本。 */
 async function loadReportIntoCache(range, mode) {
+  const key = REPORT_KEY(range, mode);
+  const seq = diskWriteSeq;
   const text = await loadSavedReport(range, mode);
-  reportDiskText.set(REPORT_KEY(range, mode), text);
+  // 读盘期间这份报告刚被保存过：缓存里那份比磁盘快照新，别回填旧的
+  if (seq !== diskWriteSeq && reportDiskText.has(key)) return reportDiskText.get(key);
+  reportDiskText.set(key, text);
   return text;
 }
 
@@ -1954,8 +2077,12 @@ async function cleanupReportBaks() {
   }
 }
 
-async function saveReportText(range, mode, text) {
+/** 每份报告一条保存队列：并发保存同一份时按点击顺序落盘，后完成的旧文本不能盖掉新文本。 */
+const saveQueues = new Map();
+
+async function writeReportText(range, mode, text) {
   const rel = reportRel(range, mode);
+  const key = REPORT_KEY(range, mode);
   let cur = null;
   try {
     cur = await appCtx.documentStorage.readText(rel);
@@ -1965,15 +2092,43 @@ async function saveReportText(range, mode, text) {
   try {
     await appCtx.documentStorage.writeTextAtomic(rel, text, cur ? cur.version : null);
   } catch (e) {
-    // CAS 冲突：重新读一次再写，避免把外部改动整个顶掉
+    // 版本冲突。只有在「磁盘内容仍是我们最后看到的那个版本」时才重试——
+    // 内容变了说明别处（另一个窗口、同步盘）改过它，拿对方的新 version
+    // 强写就是把外部改动顶掉，那正是这一重试想避免的事。
     const again = await appCtx.documentStorage.readText(rel).catch(() => null);
-    await appCtx.documentStorage.writeTextAtomic(rel, text, again ? again.version : null);
+    const known = reportDiskText.has(key) ? reportDiskText.get(key) : null;
+    const sameAsKnown = again && known !== null && String(again.content || "") === known;
+    if (sameAsKnown) {
+      await appCtx.documentStorage.writeTextAtomic(rel, text, again.version);
+    } else {
+      throw new Error("这份报告在别处被修改过，本次保存没有覆盖它；请先看一眼历史里的版本再决定");
+    }
   }
   await removeDoc(rel + ".bak");
-  reportDiskText.set(REPORT_KEY(range, mode), text);
-  reportDraftText.delete(REPORT_KEY(range, mode));
-  // 保存成功后草稿就没用了：同步把 storage 里那份也清掉
+  reportDiskText.set(key, text);
+  diskWriteSeq += 1;   // 让在途的读盘知道磁盘已经不是它读到的那一版了
+  // 只有「草稿就是刚写进去的这一版」才清：写完到落盘之间用户可能又改了，
+  // 那时的草稿是更新的内容，不能一起抹掉。
+  const draft = reportDraftText.has(key) ? reportDraftText.get(key) : null;
+  if (draft === null || draft === text) reportDraftText.delete(key);
   persistDraftsSoon();
+}
+
+async function saveReportText(range, mode, text) {
+  const key = REPORT_KEY(range, mode);
+  const prev = saveQueues.get(key) || Promise.resolve();
+  const run = prev.then(
+    () => writeReportText(range, mode, text),
+    () => writeReportText(range, mode, text)
+  );
+  saveQueues.set(
+    key,
+    run.then(
+      () => {},
+      () => {}
+    )
+  );
+  return run;
 }
 
 /** 切换范围或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
@@ -1985,6 +2140,11 @@ let reportSwitchSeq = 0;
 async function switchView(range, mode, extra) {
   const r = normalizeRange(range);
   const key = rangeKey(r);
+  viewPickSeq += 1;
+  // 调用方可能忘了先把编辑区交回 store（例如直接在口吻按钮上点击、
+  // 输入框还没 blur）。用面板里的最新文本覆盖 store 再 stash，
+  // 否则最后一段输入不会进草稿。
+  commitEditorDraft();
   stashReportDraft();
   reportSwitchSeq += 1;
   const seq = reportSwitchSeq;
@@ -2019,10 +2179,13 @@ function rememberMode(mode) {
   if (!appCtx || !appCtx.storage || typeof appCtx.storage.set !== "function") return;
   const tone = store.snap.settings ? store.snap.settings.tone : "";
   try {
-    void appCtx.storage.set(VIEW_KEY, {
-      mode: String(mode || ""),
-      tone: String(tone || ""),
-    });
+    // 外层 try 只拦同步抛出，宿主拒绝写入是 rejection
+    void Promise.resolve(
+      appCtx.storage.set(VIEW_KEY, {
+        mode: String(mode || ""),
+        tone: String(tone || ""),
+      })
+    ).catch(() => {});
   } catch (e) {
     /* 记不住只影响下次打开，不算失败 */
   }
@@ -2316,7 +2479,7 @@ function buildFactsDigest(facts, gitList) {
         "（" + (hhmm(s.firstSeenAt) || "?") + "–" + (hhmm(s.lastSeenAt) || "?") +
         (active ? "，活跃 " + active : "") +
         "，用户 " + s.userTurns + " 轮，工具 " +
-        Object.values(s.tools).reduce((a, b) => a + b, 0) + " 次）" +
+        Object.values(s.tools || {}).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0) + " 次）" +
         (s.continuedFromEarlierDay ? " [前一天已开始]" : "")
       );
 
@@ -2324,7 +2487,8 @@ function buildFactsDigest(facts, gitList) {
       const fixed = [];
       if (s.finalAssistantText) fixed.push("  最后回复：" + clip(oneLine(s.finalAssistantText), 300));
 
-      const toolTop = Object.entries(s.tools)
+      const toolTop = Object.entries(s.tools || {})
+        .filter(([, n]) => Number.isFinite(n))
         .sort((a, b) => b[1] - a[1])
         .slice(0, 6)
         .map(([name, n]) => name + "×" + n)
@@ -2334,21 +2498,21 @@ function buildFactsDigest(facts, gitList) {
       const cmds = pickCommands(s.commands);
       if (cmds) fixed.push("  常执行：" + cmds);
 
-      if (s.hotFiles && s.hotFiles.length) {
+      if (Array.isArray(s.hotFiles) && s.hotFiles.length) {
         fixed.push(
           "  反复编辑：" +
           s.hotFiles.slice(0, 5).map((f) => shortPath(f.path) + " 编辑 " + f.edits + " 次").join("；")
         );
       }
 
-      if (s.toolErrors.length) {
+      if ((s.toolErrors || []).length) {
         fixed.push(
           "  工具报错 " + s.toolErrors.length + " 次：" +
           s.toolErrors.slice(0, 5).map((e) => clip(oneLine(e.text), 160)).join(" | ")
         );
       }
 
-      if (s.editedFiles.length) {
+      if ((s.editedFiles || []).length) {
         fixed.push("  改动文件 " + s.editedFiles.length + " 个：" + s.editedFiles.slice(0, 12).join(", "));
       }
 
@@ -2394,7 +2558,12 @@ function buildFactsDigest(facts, gitList) {
 
 /* ---------------------------------------------------------------- AI 生成 */
 
-function runAgent(prompt, startOpts, signal) {
+/** 跑一轮后台生成。
+ *
+ *  提示词只从 startOpts 走：宿主真正使用的是 startOpts.prompt，
+ *  以前的第一个参数在任何路径下都不会被读到，留着只会让调用方
+ *  以为改它能改提示词。 */
+function runAgent(startOpts, signal) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let acc = "";
@@ -2423,7 +2592,8 @@ function runAgent(prompt, startOpts, signal) {
       // 超时 / 引擎报错 / 需要交互：宿主那边可能还在跑，主动收掉，别白花 token
       if (err && expectedRunId && appCtx) {
         try {
-          void appCtx.agent.interrupt(expectedRunId);
+          // 外层 try 只拦同步抛出，IPC 失败是 rejection
+          void Promise.resolve(appCtx.agent.interrupt(expectedRunId)).catch(() => {});
         } catch (e) {
           /* 轮次可能已经结束 */
         }
@@ -2591,7 +2761,6 @@ async function generateReport() {
     const prompt = promptFor(targetMode, targetRange) + "\n\n===== 事实 =====\n" + digest;
 
     const text = await runAgent(
-      prompt,
       {
         engine: entry.engine,
         model: model,
@@ -2611,6 +2780,9 @@ async function generateReport() {
       rangeKey(store.snap.range) === targetKey && store.snap.reportMode === targetMode;
     set({ generating: false, streamText: "", runId: "" });
     if (sameView) set({ report: text });
+    // 生成是最贵的产出，同样要进草稿体系：不然热重载/重启就没了，
+    // 而这正是草稿持久化要覆盖的「写到一半」场景。
+    noteDraft(targetRange, targetMode, text);
     flash("报告已生成，点「保存」写入文件");
   } catch (e) {
     // 停止导致的 reject 不是错误，静默退出
@@ -2647,9 +2819,24 @@ async function stopGenerate() {
 
 /* ---------------------------------------------------------------- 动作 */
 
+/** 会话 id / 工作区来自会话日志（外部输入），交给宿主前先做形状校验：
+ *  它们会被当成参数转给宿主进程，不该原样透传任意字符串。 */
 async function openSession(session) {
+  const engine = String(session && session.engine ? session.engine : SCAN_ENGINE_ID);
+  const sessionId = String(session && session.sessionId ? session.sessionId : "").trim();
+  const workspace = String(session && session.workspace ? session.workspace : "").trim();
+  // Claude Code 的 sessionId 是 UUID；放宽到「无空白、无路径分隔符」，
+  // 既覆盖真实形状，也挡住 ../ 之类的注入尝试。
+  if (!sessionId || sessionId.length > 128 || /[\s/\\:*?"<>|]/.test(sessionId)) {
+    set({ error: "这个会话的 ID 看起来不合法，无法打开。" });
+    return;
+  }
+  if (workspace && (workspace.length > 4096 || workspace.includes("\0"))) {
+    set({ error: "这个会话记录的工作区路径不合法，无法打开。" });
+    return;
+  }
   try {
-    await appCtx.sessions.selectSession(session.engine || "claude", session.sessionId, session.workspace);
+    await appCtx.sessions.selectSession(engine, sessionId, workspace || undefined);
   } catch (e) {
     set({ error: "打开会话失败：" + safeError(e) });
   }
@@ -2722,6 +2909,9 @@ async function changeRange(next, preset) {
  * 把某个范围内已存的扫描快照放回界面（如果存在）。
  * 只补「空的」那一屏：用户已经主动扫出结果时不能覆盖。
  */
+/** 补读快照的轮次：同一范围连点几次「本周」，晚到的旧读盘不能盖掉新结果。 */
+let restoreSeq = 0;
+
 async function restoreFactsFor(range) {
   const r = normalizeRange(range);
   const key = rangeKey(r);
@@ -2731,9 +2921,11 @@ async function restoreFactsFor(range) {
     const cur = store.snap.facts.range;
     if (cur && cur.from === r.from && cur.to === r.to) return;
   }
+  const seq = ++restoreSeq;
   const facts = await loadFactsSnapshot(r);
   if (!facts) return;
-  // 读盘期间用户可能又换了范围
+  // 读盘期间用户可能又换了范围，或开始了新一轮扫描
+  if (seq !== restoreSeq) return;
   if (rangeKey(store.snap.range) !== key || store.snap.scanning) return;
   if (store.snap.facts) return;
   set({ facts: facts, mutedWorkspaces: [] });
@@ -2902,12 +3094,19 @@ function SessionBlock(props) {
   const open = R.useState(false);
   const isOpen = open[0];
   const setOpen = open[1];
-  const s = props.session;
-  const tools = Object.entries(s.tools || {})
+  // 快照是本机文件，字段可能是手改坏的类型：全在这里兜住，
+  // 免得单个会话的脏数据把整页渲染打挂。
+  const s = props.session && typeof props.session === "object" ? props.session : {};
+  const allMessages = Array.isArray(s.userMessages) ? s.userMessages : [];
+  const editedFiles = Array.isArray(s.editedFiles) ? s.editedFiles : [];
+  const toolErrors = Array.isArray(s.toolErrors) ? s.toolErrors : [];
+  const tools = Object.entries(s.tools && typeof s.tools === "object" ? s.tools : {})
+    .filter(([, n]) => Number.isFinite(n))
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
-  const toolTotal = Object.values(s.tools || {}).reduce((a, b) => a + b, 0);
-  const messages = isOpen ? s.userMessages : s.userMessages.slice(0, 3);
+  const toolTotal = Object.values(s.tools && typeof s.tools === "object" ? s.tools : {})
+    .reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+  const messages = isOpen ? allMessages : allMessages.slice(0, 3);
 
   return h(
     "section",
@@ -2918,7 +3117,7 @@ function SessionBlock(props) {
       h("span", { className: "wl-session-time" }, (hhmm(s.firstSeenAt) || "?") + "–" + (hhmm(s.lastSeenAt) || "?")),
       h("span", { className: "wl-session-id" }, String(s.sessionId).slice(0, 8)),
       h("span", { className: "wl-session-meta" }, s.userTurns + " 轮 · " + fmtNum(toolTotal) + " 次工具"),
-      s.toolErrors.length ? h("span", { className: "wl-chip neg" }, s.toolErrors.length + " 报错") : null,
+      toolErrors.length ? h("span", { className: "wl-chip neg" }, toolErrors.length + " 报错") : null,
       s.continuedFromEarlierDay ? h("span", { className: "wl-chip" }, "跨天") : null,
       h("button", { className: "wl-btn ghost", onClick: () => void openSession(s) }, "打开会话")
     ),
@@ -2931,10 +3130,10 @@ function SessionBlock(props) {
         { className: "wl-list" },
         messages.map((m, i) => h("li", { key: i, className: "wl-msg" }, clip(oneLine(m.text), 200))),
         s.userMessages.length > messages.length
-          ? h("li", { className: "wl-files" }, "另有 " + (s.userMessages.length - messages.length) + " 条")
+          ? h("li", { className: "wl-files" }, "另有 " + (allMessages.length - messages.length) + " 条")
           : null
       ),
-      s.userMessages.length > 3
+      allMessages.length > 3
         ? h(
             "button",
             { className: "wl-btn ghost", onClick: () => setOpen(!isOpen) },
@@ -2951,13 +3150,13 @@ function SessionBlock(props) {
         )
       : null,
     tools.length ? h("div", { className: "wl-files" }, "工具 " + tools.map(([name, n]) => name + "×" + n).join(" · ")) : null,
-    s.editedFiles.length
+    editedFiles.length
       ? h(
           "div",
           { className: "wl-files" },
-          "改动 " + s.editedFiles.length + " 个文件：" +
-            s.editedFiles.slice(0, 6).map(shortPath).join("、") +
-            (s.editedFiles.length > 6 ? " …" : "")
+          "改动 " + editedFiles.length + " 个文件：" +
+            editedFiles.slice(0, 6).map(shortPath).join("、") +
+            (editedFiles.length > 6 ? " …" : "")
         )
       : null
   );
@@ -3113,7 +3312,7 @@ function visibleFacts(facts, muted) {
     userTurns: sessions.reduce((n, s) => n + (s.userTurns || 0), 0),
     assistantTurns: sessions.reduce((n, s) => n + (s.assistantTurns || 0), 0),
     toolCalls: sessions.reduce(
-      (n, s) => n + Object.values(s.tools || {}).reduce((a, b) => a + b, 0),
+      (n, s) => n + Object.values(s.tools || {}).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0),
       0
     ),
     toolErrors: sessions.reduce((n, s) => n + (s.toolErrors || []).length, 0),
@@ -3455,6 +3654,8 @@ function renderMarkdown(text) {
 function ReportPanel() {
   const R = appCtx.react;
   const snap = store.snap;
+  // 当前编辑的是哪一份：口吻/范围一变，编辑器里的旧文本就不再属于这一屏
+  const viewKey = REPORT_KEY(snap.range, snap.reportMode);
 
   // 编辑草稿留在本组件：受控于 store 时每次按键都会让整棵树重渲染
   const draftState = R.useState(snap.report);
@@ -3485,6 +3686,14 @@ function ReportPanel() {
     if (saveStatus && saveStatus !== "saving") setSaveStatus("");
     if (draft !== snap.report) setDraft(snap.report);
   }
+  // 编辑区的最新文本同步给模块级：切口吻/扫描/卸载走的是 store，
+  // 用户在没 blur 的情况下点按钮，那一版必须先被看到。
+  // 视图刚切换的这一帧里 draft 还是上一份的文本，不能挂到新 key 上：
+  // 上一帧已经按旧 key 发布过了，这里跳过，下一个渲染帧会自动补上。
+  const editorKeyRef = R.useRef(viewKey);
+  const viewChanged = editorKeyRef.current !== viewKey;
+  if (viewChanged) editorKeyRef.current = viewKey;
+  if (!viewChanged) noteEditorDraft(viewKey, draft);
 
   // 点按钮前先把草稿交回 store，后续动作读的才是最新内容
   const commit = () => {
@@ -3492,6 +3701,7 @@ function ReportPanel() {
       seen.current = draft;
       set({ report: draft });
     }
+    noteEditorDraft(viewKey, draft);
   };
 
   const tones = allTones();
@@ -3920,20 +4130,31 @@ async function deleteReport(entry) {
   }
   // 宿主原子写入留下的 .bak 属于同一份报告，一起清掉
   await removeDoc(rel + ".bak");
-  // 内存里那两份副本也要清掉，否则切回这个范围还会看到已删的内容
+  // 内存里那份磁盘副本也要清掉，否则切回这个范围还会看到已删的内容。
+  // 草稿是另一回事：它可能是用户此刻正在写、还没保存的内容，
+  // 删磁盘上的旧报告不等于要丢掉编辑区里的东西。
   const key = REPORT_KEY({ from: entry.from, to: entry.to }, entry.mode);
   reportDiskText.delete(key);
-  reportDraftText.delete(key);
-  persistDraftsSoon();
+  diskWriteSeq += 1;
   // 正在看的就是这份：关掉浮层
   const cur = store.snap.viewer;
   if (cur && cur.rel === rel) set({ viewer: null });
-  // 面板里现在装的正是这份报告：清空，避免用户以为它还存着
-  if (rangeKey(store.snap.range) === rangeKey({ from: entry.from, to: entry.to }) && store.snap.reportMode === entry.mode) {
-    set({ report: "", reportSaved: "" });
+  // 面板里现在装的正是这份报告：只把「已保存到哪一版」清掉。
+  // 编辑区里可能是未保存的草稿，删除磁盘文件不该连带清空它。
+  const isCurrentPanel =
+    rangeKey(store.snap.range) === rangeKey({ from: entry.from, to: entry.to }) &&
+    store.snap.reportMode === entry.mode;
+  if (isCurrentPanel) {
+    set({ reportSaved: "" });
   }
+  // 草稿只有两种身份：用户此刻正在编辑（面板就是这份）时留着，
+  // 否则是早前留下的、对应的磁盘文件已经没了，留着只会在切回来时复活旧内容。
+  if (!isCurrentPanel) reportDraftText.delete(key);
+  persistDraftsSoon();
   set({ pendingDelete: null });
-  flash("已删除 " + rel);
+  flash(isCurrentPanel && String(store.snap.report || "").trim()
+    ? "已删除磁盘上的 " + rel + "；编辑区里未保存的内容仍保留"
+    : "已删除 " + rel);
   await loadReportList();
 }
 
@@ -3955,6 +4176,9 @@ async function openViewerInPanel() {
     error: "",
     mutedWorkspaces: [],
   });
+  // 和 changeRange 一样：切到某个范围就把上次扫描的快照摆回来，
+  // 否则从历史打开旧报告后左侧扫描区是空的。
+  void restoreFactsFor(range);
 }
 
 /**
@@ -4035,8 +4259,7 @@ function ReportHistory() {
           if (!open) void loadReportList();
           // 收起时清掉「等待确认删除」：下次打开不该还停在一键即删的状态
           else if (store.snap.pendingDelete) set({ pendingDelete: null });
-        },
-      },
+        },      },
       h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
       h("b", null, "报告历史"),
       h(
@@ -4058,8 +4281,10 @@ function ReportHistory() {
         ? h(
             "div",
             { className: "wl-history-body" },
-            // 报告多到需要折叠时，查找才是真需求；只有一两份就别占一行地方了
-            rows.length > 6
+            // 报告多到需要折叠时，查找才是真需求；只有一两份就别占一行地方了。
+            // 但过滤词还在时必须露出输入框：删到 6 份以下时行数条件会让
+            // 输入框和「清空」一起消失，列表卡死在过滤态且没有出口。
+            rows.length > 6 || filter
               ? h(
                   "div",
                   { className: "wl-history-search" },
@@ -4191,21 +4416,55 @@ function ReportViewer() {
   const snap = useSnap();
   const v = snap.viewer;
   const closeRef = R.useRef(null);
+  const boxRef = R.useRef(null);
+  // 打开前的焦点：关闭后还回去，用户不用重新找刚才停在哪
+  const returnFocusRef = R.useRef(null);
 
   // 打开时把焦点放到关闭按钮：键盘用户不用先 Tab 一圈才逃得出去
   R.useEffect(() => {
     if (!v) return;
+    if (typeof document !== "undefined") returnFocusRef.current = document.activeElement || null;
     const el = closeRef.current;
     if (el && typeof el.focus === "function") el.focus();
+    return () => {
+      const prev = returnFocusRef.current;
+      returnFocusRef.current = null;
+      if (prev && typeof prev.focus === "function") {
+        try {
+          prev.focus();
+        } catch (e) {
+          /* 元素已经不在文档里 */
+        }
+      }
+    };
   }, [v ? v.rel : null]);
 
-  // Esc 关闭。挂在 document 上，焦点在浮层里任意位置都能收到
+  // Esc 关闭 + 焦点陷阱：aria-modal 说了「浮层外的内容不可达」，
+  // 就得真的把 Tab 圈在浮层里。
   R.useEffect(() => {
     if (!v || typeof document === "undefined") return;
     const onKey = (ev) => {
       if (ev.key === "Escape") {
         ev.preventDefault();
         closeViewer();
+        return;
+      }
+      if (ev.key !== "Tab") return;
+      const box = boxRef.current;
+      if (!box || typeof box.querySelectorAll !== "function") return;
+      const nodes = box.querySelectorAll(
+        'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+      );
+      if (!nodes.length) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey && (active === first || !box.contains(active))) {
+        ev.preventDefault();
+        if (typeof last.focus === "function") last.focus();
+      } else if (!ev.shiftKey && (active === last || !box.contains(active))) {
+        ev.preventDefault();
+        if (typeof first.focus === "function") first.focus();
       }
     };
     document.addEventListener("keydown", onKey);
@@ -4237,6 +4496,7 @@ function ReportViewer() {
         role: "dialog",
         "aria-modal": "true",
         "aria-label": "查看报告 " + title,
+        ref: boxRef,
         onClick: (ev) => ev.stopPropagation(),
       },
       h(
@@ -4432,6 +4692,27 @@ function Dropdown(props) {
     }
   };
 
+  // 焦点会被移到选项 div 上（见上面的 useEffect），此后 trigger 的
+  // onKeyDown 收不到事件：键盘操作必须在菜单上再接一层，
+  // 否则方向键、回车、Esc 在选项上全部失效。
+  const onMenuKeyDown = (ev) => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      setOpen(false);
+      const el = triggerRef.current;
+      if (el && typeof el.focus === "function") el.focus();
+    } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      move(ev.key === "ArrowDown" ? 1 : -1);
+    } else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      choose(items[focusIdx]);
+    } else if (ev.key === "Tab") {
+      // Tab 离开就收起，别把展开的菜单留在身后
+      setOpen(false);
+    }
+  };
+
   return h(
     "div",
     { className: "wl-dd" + (open ? " is-open" : "") + (up ? " is-up" : "") },
@@ -4458,7 +4739,7 @@ function Dropdown(props) {
     open
       ? h(
           "div",
-          { className: "wl-dd-menu", role: "listbox" },
+          { className: "wl-dd-menu", role: "listbox", onKeyDown: onMenuKeyDown },
           items.length
             ? items.map((item, i) =>
                 h(
@@ -4504,10 +4785,37 @@ function EnvRow(props) {
   );
 }
 
+/* 目录授权：path → grantId。只有本次会话里选择过的目录才记得住，
+ *  用来在用户不再使用某个目录时把授权还回去。 */
+const grantIds = new Map();
+
+/** 撤销一个目录的授权（如果它确实是用户选来的）。 */
+async function revokeGrant(path) {
+  const grantId = path ? grantIds.get(String(path)) : "";
+  if (!grantId || !appCtx || !appCtx.assets || typeof appCtx.assets.revokeDirectory !== "function") return;
+  grantIds.delete(String(path));
+  try {
+    await appCtx.assets.revokeDirectory(grantId);
+  } catch (e) {
+    /* 授权可能已经失效 */
+  }
+}
+
+/** 目录不再被任何设置引用时才撤销它的授权。 */
+async function revokeUnusedGrant(path) {
+  const cur = store.snap.settings || {};
+  const used = [cur.sessionRoot, cur.workspacePath].concat(Array.isArray(cur.extraPaths) ? cur.extraPaths : []);
+  if (used.some((p) => p && workspaceKey(p) === workspaceKey(path))) return;
+  await revokeGrant(path);
+}
+
+async function revokeUnusedGrants() {
+  for (const path of [...grantIds.keys()]) await revokeUnusedGrant(path);
+}
+
 function SettingsSection() {
   const R = appCtx.react;
-  const snap = useSnap();
-  const formState = R.useState(null);
+  const snap = useSnap();  const formState = R.useState(null);
   const form = formState[0] || snap.settings;
   const setForm = formState[1];
   // "" → "saving" → "saved"/"error"。设置改了就生效，不需要用户再记着点保存。
@@ -4531,7 +4839,11 @@ function SettingsSection() {
     }
     try {
       const grant = await appCtx.assets.grantDirectory();
-      return grant && grant.path ? String(grant.path) : "";
+      if (!grant || !grant.path) return "";
+      // 记下这次授权：用户换掉目录后要把它还回去，否则每选一次就多一条
+      // 永久授权，攒久了设置里会看到一堆早就没用的目录。
+      if (grant.grantId) grantIds.set(String(grant.path), String(grant.grantId));
+      return String(grant.path);
     } catch (e) {
       /* 取消选择 */
       return "";
@@ -4539,9 +4851,12 @@ function SettingsSection() {
   }
 
   async function choosePath(key) {
+    const before = String((form && form[key]) || "");
     const picked = await pickGrant();
     if (!picked) return;
     patch(key, picked);
+    if (before && workspaceKey(before) !== workspaceKey(picked)) void revokeUnusedGrant(before);
+    void revokeUnusedGrants();
     flash("已选择 " + displayPath(picked));
   }
 
@@ -4559,7 +4874,12 @@ function SettingsSection() {
 
   function removeExtraPath(idx) {
     const cur = Array.isArray(form.extraPaths) ? form.extraPaths : [];
+    const gone = cur[idx];
     patch("extraPaths", cur.filter((_, i) => i !== idx));
+    if (gone) {
+      // 等这一版设置写进去再判断：它可能同时还被会话根目录/运行目录用着
+      setTimeout(() => void revokeUnusedGrant(gone), 700);
+    }
   }
 
   // 切换报告的保存位置。selectLocation("custom") 会打开宿主目录选择器，
@@ -4592,8 +4912,27 @@ function SettingsSection() {
       } catch (e) {
         note = "；旧文件搬运失败：" + safeError(e);
       }
+      // 换了目录，内存里缓存的都是旧目录的内容：不清掉的话切回某个范围
+      // 还会显示上一处目录里的报告，历史列表也还是旧的。
+      reportDiskText.clear();
+      diskWriteSeq += 1;
+      set({ viewer: null, pendingDelete: null, reportSaved: "" });
+      // 当前这份草稿在旧目录没保存过：重新按新目录读一遍
+      void showReportForCurrentView();
+      void loadReportList();
+      void cleanupReportBaks();
     }
     flash(doneText + " " + displayPath(to) + note);
+  }
+
+  /** 按当前范围 + 口吻重新读一次报告（换目录后用）。 */
+  async function showReportForCurrentView() {
+    const range = normalizeRange(store.snap.range);
+    const mode = store.snap.reportMode;
+    const key = rangeKey(range);
+    const text = await loadReportIntoCache(range, mode);
+    if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
+    showReport(range, mode, text);
   }
 
   const changeReportDir = () => switchStorage("custom", "报告目录已改为");
@@ -5135,7 +5474,12 @@ function SettingsSection() {
 
 /* ---------------------------------------------------------------- 激活 */
 
+/** 用户主动切换范围/口吻的次数。bootstrap 用它判断「我读设置这段时间里，
+ *  用户是不是已经自己选过了」——选过就不该再按启动值覆盖回去。 */
+let viewPickSeq = 0;
+
 async function bootstrap() {
+  const pickSeqAtStart = viewPickSeq;
   const settings = await readSettings();
   if (!appCtx) return;
   // 口吻可能是自定义的：只认得出来的那个，认不出就回到日报
@@ -5159,7 +5503,12 @@ async function bootstrap() {
       : tones.includes(settings.tone)
         ? settings.tone
         : "daily";
-  set({ settings: settings, ready: true, reportMode: mode });
+  // 读设置这段时间里，用户可能已经自己切过范围或口吻：那就只更新设置，
+  // 不能把启动时算出的 mode 拨回去盖掉他的选择。
+  // 注意不要用 store.snap.ready 判定——同一模块实例再次 activate（宿主热重载 /
+  // 冒烟测试）时它是上一轮留下的 true，会让 reportMode 再也回不到记住的口吻。
+  if (viewPickSeq !== pickSeqAtStart) set({ settings: settings });
+  else set({ settings: settings, ready: true, reportMode: mode });
   void loadCatalog();
   void refreshStorageLocation();
   void cleanupReportBaks();
@@ -5168,9 +5517,13 @@ async function bootstrap() {
   await loadPersistedDrafts();
   // 把今天（或上次停在的范围）的扫描结果读回来，否则每次打开都是一片空白
   void restoreFactsFor(store.snap.range);
-  const saved = await loadReportIntoCache(store.snap.range, mode);
+  // 用户在此期间可能已经切了范围或口吻：按「此刻」的视图读，读完再校验一次
+  const targetRange = normalizeRange(store.snap.range);
+  const targetMode = store.snap.reportMode;
+  const saved = await loadReportIntoCache(targetRange, targetMode);
+  if (rangeKey(store.snap.range) !== rangeKey(targetRange) || store.snap.reportMode !== targetMode) return;
   // 有未保存草稿就用草稿，别让磁盘内容把它盖掉
-  const draftKey = REPORT_KEY(store.snap.range, mode);
+  const draftKey = REPORT_KEY(targetRange, targetMode);
   if (reportDraftText.has(draftKey) && reportDraftText.get(draftKey) !== saved) {
     set({ report: reportDraftText.get(draftKey), reportSaved: saved });
   } else if (saved) {
@@ -5188,13 +5541,20 @@ export default function activate(ctx) {
   appCtx = ctx;
   const disposers = [];
 
-  try {
-    disposers.push(ctx.theme.injectCss(CSS));
-  } catch (e) {
-    /* 主题注入失败不影响功能 */
+  /** 注册入口逐个兜底：宿主某个 UI 扩展点不可用时，不能因此跳过前面的
+   *  disposer（CSS 会永久残留），也不能让后面的入口全部注册不上。 */
+  function register(what, fn, silent) {
+    try {
+      const d = fn();
+      if (typeof d === "function") disposers.push(d);
+    } catch (e) {
+      if (!silent) set({ error: what + "注册失败：" + safeError(e) });
+    }
   }
 
-  disposers.push(
+  register("样式", () => ctx.theme.injectCss(CSS), true);
+
+  register("中央页签", () =>
     ctx.ui.registerCenterTab({
       key: TAB_KEY,
       title: () => "工作志",
@@ -5204,7 +5564,7 @@ export default function activate(ctx) {
     })
   );
 
-  disposers.push(
+  register("侧栏入口", () =>
     ctx.ui.registerSidebarNav({
       key: PLUGIN_ID,
       label: () => "工作志",
@@ -5221,7 +5581,7 @@ export default function activate(ctx) {
     })
   );
 
-  disposers.push(
+  register("设置区", () =>
     ctx.ui.registerSettingsSection({
       key: PLUGIN_ID,
       label: () => "工作志",
@@ -5230,7 +5590,7 @@ export default function activate(ctx) {
     })
   );
 
-  disposers.push(
+  register("命令", () =>
     ctx.ui.registerCommand({
       key: PLUGIN_ID,
       title: () => "工作志：查看今日工作志",
@@ -5249,6 +5609,14 @@ export default function activate(ctx) {
 
   return () => {
     if (toastTimer) clearTimeout(toastTimer);
+    // 草稿防抖还没到点就卸载：把编辑区最新内容记下来并立刻写一次。
+    // 等定时器醒来时 appCtx 已是 null，最后 400ms 的输入会无声消失——
+    // 这正是草稿持久化要覆盖的场景。
+    if (draftSaveTimer) clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+    commitEditorDraft();
+    stashReportDraft();
+    flushDraftsNow();
     // 卸载/热重载时收掉进行中的生成：abort 会停掉计时器与事件监听，
     // 再 interrupt 一次兜住 start 尚未 resolve、runId 还没回填的情况。
     genSeq += 1;
@@ -5264,7 +5632,8 @@ export default function activate(ctx) {
     const runId = store.snap.runId;
     if (runId && appCtx) {
       try {
-        void appCtx.agent.interrupt(runId);
+        // 外层 try 只拦同步抛出，宿主 IPC 失败时 rejection 需要自己接住
+        void Promise.resolve(appCtx.agent.interrupt(runId)).catch(() => {});
       } catch (e) {
         /* 轮次可能已经结束 */
       }
