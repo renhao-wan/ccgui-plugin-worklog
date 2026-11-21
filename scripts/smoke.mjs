@@ -87,6 +87,29 @@ function makeFixture() {
 
 makeFixture();
 
+/* ------------------------------------------------------------ DOM 替身 */
+// 插件只用到 document.addEventListener/removeEventListener（浮层的 Esc 关闭）。
+// 给一个最小实现，能验证「注册了、关掉时解绑了」这件事本身。
+const docListeners = new Map();
+globalThis.document = {
+  addEventListener: (type, fn) => {
+    if (!docListeners.has(type)) docListeners.set(type, new Set());
+    docListeners.get(type).add(fn);
+  },
+  removeEventListener: (type, fn) => {
+    const set = docListeners.get(type);
+    if (set) set.delete(fn);
+  },
+  createElement: () => ({ style: {}, setAttribute() {}, select() {}, value: "" }),
+  body: { appendChild() {}, removeChild() {} },
+  execCommand: () => true,
+};
+function fireDocKey(key) {
+  const set = docListeners.get("keydown");
+  if (!set) return;
+  for (const fn of [...set]) fn({ key: key, preventDefault() {} });
+}
+
 /* ------------------------------------------------------------ React 替身 */
 
 const states = new Map();
@@ -1186,6 +1209,60 @@ check("报告历史按范围与口吻列已保存的报告", () => {
   assert.ok(texts.some((t) => t.includes(monday + " 至 " + DATE)), "应列出本周这份");
 });
 
+// 攒到几十上百份时，列表要按月份分开、并限高滚动，不能把整页顶下去
+check("报告历史按月分组并限高滚动", () => {
+  const t = renderKeep(tabDef.component);
+  const groups = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-group")) groups.push(n);
+  });
+  assert.ok(groups.length >= 1, "应有月份分组");
+  const months = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-month")) months.push(textOf(n));
+  });
+  assert.equal(months.length, groups.length, "每个月分组应各有一个标题");
+  assert.match(months[0], /^\d{4}-\d{2}/, "分组标题应是月份，实际 " + months[0]);
+  assert.ok(byClass(t, "wl-history-scroll"), "整个历史列表应有统一的限高滚动容器");
+});
+
+// 月份默认折叠：最新一个月展开，更早的收起；点标题才展开那一组。
+// 造一份上个月的报告，验证「默认不铺开」和「点了能展开」。
+const prevMonthDay = (() => {
+  const d = new Date(today);
+  d.setDate(1);
+  d.setMonth(d.getMonth() - 1);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-15";
+})();
+fs.writeFileSync(path.join(storageDir, "reports", prevMonthDay + "-retro.md"), "# 上个月的复盘\n", "utf8");
+// 收起再展开一次，触发重新读盘
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+await sleep(120);
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+const monthButtons = (t) => {
+  const out = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-month")) out.push(n);
+  });
+  return out;
+};
+await waitFor(() => monthButtons(renderKeep(tabDef.component)).length >= 2, 3000);
+check("报告历史默认只展开最新月份", () => {
+  let t = renderKeep(tabDef.component);
+  const btns = monthButtons(t);
+  assert.equal(btns.length, 2, "应有两个月份分组，实际 " + btns.length);
+  assert.equal(btns[0].props["aria-expanded"], "true", "最新月份应默认展开");
+  assert.equal(btns[1].props["aria-expanded"], "false", "更早的月份应默认收起");
+  assert.ok(!textOf(t).includes(prevMonthDay), "收起时不该渲染那一组的报告行");
+  btns[1].props.onClick();
+  t = renderKeep(tabDef.component);
+  assert.equal(monthButtons(t)[1].props["aria-expanded"], "true", "点月份标题后应展开");
+  assert.ok(textOf(t).includes(prevMonthDay), "展开后应看到上个月的报告");
+});
+
 // 宿主 list(prefix) 的两种语义（带/不带尾斜杠、返回带/不带前缀）都要能列出报告。
 // 真实宿主里曾因为拼法与预期不符返回空数组，界面就显示成「还没有保存过报告」。
 const origListImpl = ctx.documentStorage.list;
@@ -1193,6 +1270,8 @@ const listVariants = {
   "带尾斜杠 + 带前缀（SDK 文档写法）": (prefix) => origListImpl(prefix),
   "只给文件名": async (prefix) => (await origListImpl(prefix)).map((p) => p.replace(/^reports\//, "")),
   "只认不带尾斜杠的前缀": async (prefix) => (String(prefix).endsWith("/") ? [] : origListImpl(prefix + "/")),
+  // 部分宿主返回 { path, size } 对象；直接 String() 会变成 "[object Object]"
+  "返回对象 { path, size }": async (prefix) => (await origListImpl(prefix)).map((p) => ({ path: p, size: 1 })),
 };
 const listVariantResults = [];
 try {
@@ -1230,11 +1309,62 @@ check("宿主 list 语义变化时报告历史仍然读得到", () => {
   );
 });
 
+// 点历史只开浮层查看，不能把右侧生成面板里的内容换掉：
+// 那是正在写的工作台，看一份旧报告不该丢掉当前草稿。
+const panelBefore = renderFresh(tabDef.component);
+const areaBefore = byClass(panelBefore, "wl-textarea");
+const beforeValue = areaBefore ? String(areaBefore.props.value) : "";
 const weekRow = historyRows.find((r) => textOf(r).includes(monday + " 至 " + DATE));
 weekRow.props.onClick();
 await sleep(200);
-check("点历史记录回到那份报告", () => {
+check("点历史记录打开只读查看器", () => {
   const t = renderFresh(tabDef.component);
+  const mask = byClass(t, "wl-viewer-mask");
+  assert.ok(mask, "应出现查看器浮层");
+  assert.match(textOf(mask), new RegExp(monday + " 至 " + DATE), "标题应是那份报告的范围");
+  const dialog = byClass(mask, "wl-viewer");
+  assert.equal(dialog.props["aria-modal"], "true", "浮层应是模态对话框");
+  assert.match(textOf(dialog), /本周周报/, "应显示报告正文");
+  assert.ok(byClass(dialog, "wl-md"), "正文应走 Markdown 渲染");
+});
+check("查看历史不影响右侧生成面板", () => {
+  const t = renderFresh(tabDef.component);
+  const area = byClass(t, "wl-textarea") || byClass(t, "wl-md");
+  assert.ok(area, "面板内容应还在");
+  assert.equal(
+    byClass(t, "wl-textarea") ? String(byClass(t, "wl-textarea").props.value) : "",
+    beforeValue,
+    "面板里的内容不应被历史报告替换"
+  );
+});
+
+// Esc 是浮层的约定出口；关闭后 keydown 监听要解绑，不能留在 document 上
+// 注意用 renderKeep：renderFresh 默认丢弃 effect，监听根本不会挂上
+renderKeep(tabDef.component);
+check("查看器打开时注册了 Esc 关闭", () => {
+  assert.ok((docListeners.get("keydown") || new Set()).size > 0, "打开时应挂上 keydown");
+});
+fireDocKey("Escape");
+await sleep(120);
+check("Esc 关闭查看器并解绑监听", () => {
+  renderKeep(tabDef.component);
+  assert.equal(byClass(renderKeep(tabDef.component), "wl-viewer-mask"), null, "Esc 应关闭浮层");
+  assert.equal((docListeners.get("keydown") || new Set()).size, 0, "关闭后应解绑 keydown");
+});
+// 关掉之后面板仍原样，Esc 不该顺带切换视图
+check("Esc 关闭后右侧面板仍没被替换", () => {
+  const area = byClass(renderFresh(tabDef.component), "wl-textarea");
+  assert.equal(area ? String(area.props.value) : "", beforeValue);
+});
+
+// 重新打开浮层，验证「在面板中打开」——这是用户明确要求切换的那一步
+weekRow.props.onClick();
+await sleep(200);
+findByText(byClass(renderFresh(tabDef.component), "wl-viewer"), "在面板中打开").props.onClick();
+await sleep(200);
+check("从查看器在面板中打开这份报告", () => {
+  const t = renderFresh(tabDef.component);
+  assert.equal(byClass(t, "wl-viewer-mask"), null, "点完应关闭浮层");
   assert.match(textOf(t), new RegExp(monday + " 至 " + DATE));
   const area = byClass(t, "wl-textarea");
   assert.ok(area, "应显示报告内容");

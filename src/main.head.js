@@ -593,20 +593,91 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-history-toggle:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
 .wl-history-toggle b { font-weight:500; }
 .wl-history-toggle .wl-muted { margin-left:auto; font-size:12px; }
-.wl-history-list { list-style:none; margin:0; padding:0 0 6px; border-top:1px solid var(--wl-rule); }
+/* 整个历史列表限高，内部统一滚动：月份折叠之后每个月的标题只占一行，
+ * 外层滚一滚就能看到「还有哪几个月」。内层不再各自限高——嵌套两层滚动
+ * 会让人分不清正在滚哪一层，滚轮也会在边界处卡住。
+ * 高度取 50vh：面板本身已有 621px，历史再高就会把扫描结果挤出首屏。 */
+.wl-history-scroll {
+  border-top:1px solid var(--wl-rule);
+  max-height:min(360px, 50vh); overflow-y:auto; overscroll-behavior:contain;
+}
+.wl-history-scroll:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
+.wl-history-list { list-style:none; margin:0; padding:0 0 6px; }
+/* 月份标题本身可折叠：点它展开/收起这一组。
+ * 粘在滚动区顶部：同时展开几个月往下翻时，始终知道自己在哪个月。 */
+.wl-history-month {
+  position:sticky; top:0; z-index:1;
+  display:flex; align-items:center; gap:8px; width:100%;
+  padding:6px 14px 4px; border:0; background:var(--wl-surface);
+  color:var(--wl-muted); font:inherit; font-size:11px; text-align:left; cursor:pointer;
+  font-variant-numeric:tabular-nums; border-bottom:1px solid var(--wl-rule);
+}
+.wl-history-month:hover { background:var(--wl-raised); }
+.wl-history-month:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
+.wl-history-month[aria-expanded="true"] .wl-card-caret { transform:rotate(45deg); }
+.wl-history-month-n { margin-left:auto; color:var(--wl-faint); }
+.wl-history-group + .wl-history-group .wl-history-month { border-top:1px solid var(--wl-rule); }
 .wl-history-row {
   display:flex; align-items:center; gap:10px; width:100%;
   padding:7px 14px; border:0; background:transparent; color:var(--wl-text);
   font:inherit; font-size:12px; text-align:left; cursor:pointer;
 }
 .wl-history-row:hover:not(:disabled) { background:var(--wl-raised); }
+.wl-history-row:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
 .wl-history-row:disabled { opacity:.5; cursor:not-allowed; }
 .wl-history-list li.is-current .wl-history-row { background:var(--wl-raised); }
 .wl-history-list li.is-current .wl-history-date { font-weight:500; }
+/* 正在浮层里看的那份：左侧加一条竖线，和「当前面板里的那份」区分开 */
+.wl-history-row.is-viewing { box-shadow:inset 2px 0 0 var(--wl-accent); }
 .wl-history-date { font-variant-numeric:tabular-nums; min-width:150px; }
 .wl-history-tone { color:var(--wl-muted); }
 .wl-history-size { margin-left:auto; color:var(--wl-faint); font-variant-numeric:tabular-nums; }
 .wl-history-empty { margin:0; padding:10px 14px 14px; font-size:12px; color:var(--wl-muted); }
+
+/* ---------- 历史报告查看器（浮层） ---------- */
+/* 遮罩压在 toast(120) 之下：提示仍然看得见，不至于被挡住 */
+.wl-viewer-mask {
+  position:fixed; inset:0; z-index:110;
+  display:flex; align-items:center; justify-content:center; padding:24px;
+  box-sizing:border-box; background:rgba(0,0,0,.42);
+}
+.wl-viewer {
+  display:flex; flex-direction:column; gap:0;
+  width:min(760px, 100%); max-height:min(84vh, 900px); box-sizing:border-box;
+  background:var(--wl-surface); color:var(--wl-text);
+  border:1px solid var(--wl-border); border-radius:12px;
+  box-shadow:0 24px 64px rgba(0,0,0,.32);
+  overflow:hidden;
+}
+.wl-viewer-head {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:14px 18px; border-bottom:1px solid var(--wl-rule);
+}
+.wl-viewer-title { margin:0; font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
+.wl-viewer-tone { font-size:12px; color:var(--wl-muted); }
+.wl-viewer-size { font-size:12px; color:var(--wl-faint); font-variant-numeric:tabular-nums; }
+.wl-viewer-body { flex:1 1 auto; min-height:0; overflow:auto; padding:16px 18px; }
+/* 浮层里的正文继承 .wl-md 的排版，但高度交给外层滚动，不再自己限高 */
+.wl-viewer-md { min-height:0; max-height:none; height:auto; overflow:visible; border:0; padding:0; }
+.wl-viewer-note { margin:0; font-size:13px; color:var(--wl-muted); }
+.wl-viewer-note.is-error { color:var(--wl-neg-ink); }
+.wl-viewer-foot {
+  display:flex; align-items:center; gap:10px;
+  padding:12px 18px; border-top:1px solid var(--wl-rule); background:var(--wl-raised);
+}
+.wl-viewer-path {
+  font-size:11px; color:var(--wl-faint); min-width:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+@keyframes wl-viewer-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@media (prefers-reduced-motion: no-preference) {
+  .wl-viewer { animation:wl-viewer-in .14s ease; }
+}
+/* 窄屏：浮层贴边，正文自己滚 */
+@media (max-width: 720px) {
+  .wl-viewer-mask { padding:0; align-items:stretch; }
+  .wl-viewer { width:100%; max-height:100vh; border-radius:0; border:0; }
+}
 
 /* ---------- 会话 ↔ git 交叉对账 ---------- */
 .wl-cross { display:flex; flex-direction:column; gap:4px; margin-top:2px; padding-top:6px; border-top:1px dashed var(--wl-control); }
@@ -950,6 +1021,9 @@ const store = {
     reportListLoading: false,
     // 列目录失败的原因；和「确实没有报告」分开，否则一次读盘失败看着像自己没存
     reportListError: "",
+    // 历史报告查看器：null 表示没打开。点历史里的某一份只在这里看，
+    // 不占用右侧生成面板——那块地方归「生成」用，看过往报告不该把当前草稿替换掉。
+    viewer: null,
     generating: false,
     streamText: "",
     runId: "",
@@ -1661,8 +1735,11 @@ async function listDir(dir) {
     if (!Array.isArray(list)) continue;
     const names = list
       .map((item) => {
+        // 返回项可能是字符串，也可能是 { path, size } 之类的对象：
+        // 直接 String(obj) 会得到 "[object Object]"，一个文件都列不出来
+        const raw = typeof item === "string" ? item : item && typeof item === "object" ? item.path || item.name || item.rel || "" : "";
         // 反斜杠统一成正斜杠后再裁前缀，Windows 宿主两种都可能返回
-        const s = String(item == null ? "" : item).replace(/\\/g, "/");
+        const s = String(raw).replace(/\\/g, "/");
         if (s.startsWith(base + "/")) return s.slice(base.length + 1);
         // 没带前缀（或前缀拼错）就取最后一段，至少不会把目录名混进文件名
         const cut = s.lastIndexOf("/");
@@ -3568,15 +3645,62 @@ function RangePicker() {
   );
 }
 
-/** 从「报告历史」点进一条：范围和口吻一起切换，只触发一次读盘。 */
+/**
+ * 从「报告历史」点进一条：打开只读查看器，不碰右侧生成面板。
+ *
+ * 之前是直接 switchView 到那个范围与口吻，于是点一下历史，右侧正在写的草稿
+ * 就被换成了旧内容——「生成」那块地方是工作台，不是阅读器。查看走浮层，
+ * 想接着改再点浮层里的「在面板中打开」，那才是用户明确表达要切换。
+ */
 async function openReportEntry(entry) {
-  if (!entry || store.snap.generating) return;
+  if (!entry) return;
   const range = normalizeRange({ from: entry.from, to: entry.to });
   const mode = String(entry.mode || "");
-  // 这份报告用的口吻可能已经被删掉了：文件还在，但没有模板可以重新生成
+  // 先开浮层并把标题等元信息填上，正文随后异步补：点下去立刻有反应
+  set({
+    viewer: {
+      rel: entry.rel,
+      from: range.from,
+      to: range.to,
+      mode: mode,
+      size: typeof entry.size === "number" ? entry.size : -1,
+      text: "",
+      loading: true,
+      error: "",
+    },
+  });
+  let text = "";
+  let error = "";
+  try {
+    const doc = await appCtx.documentStorage.readText(entry.rel);
+    text = doc && typeof doc.content === "string" ? doc.content : "";
+  } catch (e) {
+    // 丢掉了就看不到了：把原因显示在浮层里，而不是空白一片
+    error = safeError(e);
+  }
+  // 期间用户可能已经关掉或改看了别的：只写回自己这一次
+  const cur = store.snap.viewer;
+  if (!cur || cur.rel !== entry.rel) return;
+  set({
+    viewer: Object.assign({}, cur, { text: text, loading: false, error: error, size: text.length }),
+  });
+}
+
+/** 关掉查看器。 */
+function closeViewer() {
+  if (store.snap.viewer) set({ viewer: null });
+}
+
+/** 把查看器里这份报告装进右侧面板，接着改。用户明确要求才做这一步。 */
+async function openViewerInPanel() {
+  const v = store.snap.viewer;
+  if (!v || store.snap.generating) return;
+  const range = { from: v.from, to: v.to };
+  const mode = v.mode;
   if (!allTones().some((t) => t.id === mode)) {
     flash("这份报告的写法「" + mode + "」已经不存在了，只能查看不能重新生成");
   }
+  closeViewer();
   await switchView(range, mode, {
     rangePreset: range.from === range.to ? "day" : "custom",
     rangeDraft: range,
@@ -3587,7 +3711,13 @@ async function openReportEntry(entry) {
   });
 }
 
-/** 报告历史：点一条就切到那个范围与口吻，扫描后可直接看图。 */
+/**
+ * 报告历史：按月分组列出已保存的报告，点一条在浮层里只读查看。
+ *
+ * 分组依据是报告覆盖的「日期」（结束日所在月），不是文件名——用户想的是
+ * 「上个月那几份」。列表本身限高滚动：攒到几十上百份时，展开它不该把整页
+ * 顶到很远的地方，也不该让扫描/报告面板被挤到看不见。
+ */
 function ReportHistory() {
   const R = appCtx.react;
   const snap = useSnap();
@@ -3601,6 +3731,32 @@ function ReportHistory() {
   const busy = snap.generating;
   // 读取失败和「没有报告」是两件事：前者要说清原因，别让用户以为是自己没保存
   const listError = snap.reportListError || "";
+  const viewingRel = snap.viewer ? snap.viewer.rel : "";
+
+  // 每个月的展开状态。没点过的月份走默认：最新一个月展开，更早的收起——
+  // 报告攒到几个月时，先看到「有哪些月」，而不是把最老的那份也铺在眼前。
+  // 用户点过之后记下来，不再被默认值覆盖。
+  const monthOpenState = R.useState({});
+  const monthOpen = monthOpenState[0];
+  const setMonthOpen = monthOpenState[1];
+  const isMonthOpen = (month, index) =>
+    Object.prototype.hasOwnProperty.call(monthOpen, month) ? !!monthOpen[month] : index === 0;
+  const toggleMonth = (month, index) => {
+    // 用函数式更新：连续点两个不同月份时，基于上一次的结果合并，不丢前一次
+    setMonthOpen((prev) => {
+      const was = Object.prototype.hasOwnProperty.call(prev, month) ? !!prev[month] : index === 0;
+      return Object.assign({}, prev, { [month]: !was });
+    });
+  };
+
+  // 已经按结束日倒序排过，这里只做相邻切分，不重新排序
+  const groups = [];
+  for (const r of rows) {
+    const month = String(r.to || "").slice(0, 7);
+    const last = groups[groups.length - 1];
+    if (last && last.month === month) last.rows.push(r);
+    else groups.push({ month: month, rows: [r] });
+  }
 
   return h(
     "section",
@@ -3626,7 +3782,7 @@ function ReportHistory() {
           : listError
             ? "读取失败"
             : list
-              ? rows.length + " 份"
+              ? rows.length + " 份" + (groups.length > 1 ? " · " + groups.length + " 个月" : "")
               : "点开查看已保存的报告"
       )
     ),
@@ -3635,34 +3791,160 @@ function ReportHistory() {
         ? h("p", { className: "wl-history-empty" }, "读取报告目录失败：" + listError)
         : rows.length
         ? h(
-            "ul",
-            { className: "wl-history-list" },
-            rows.map((r) =>
-              h(
-                "li",
-                {
-                  key: r.rel,
-                  className: currentKey === r.key + "|" + r.mode ? "is-current" : "",
-                },
+            "div",
+            { className: "wl-history-scroll" },
+            groups.map((g, gi) => {
+              const show = isMonthOpen(g.month, gi);
+              return h(
+                "div",
+                { key: g.month, className: "wl-history-group" },
                 h(
                   "button",
                   {
-                    className: "wl-history-row",
-                    disabled: busy,
-                    title: busy ? "生成完成后才能切换" : "打开 " + r.rel,
-                    onClick: () => void openReportEntry(r),
+                    className: "wl-history-month",
+                    "aria-expanded": show ? "true" : "false",
+                    title: (show ? "收起 " : "展开 ") + g.month,
+                    onClick: () => toggleMonth(g.month, gi),
                   },
-                  h("span", { className: "wl-history-date" }, r.from === r.to ? r.from : r.from + " 至 " + r.to),
-                  h("span", { className: "wl-history-tone" }, toneLabel(r.mode)),
-                  typeof r.size === "number" && r.size > 0
-                    ? h("span", { className: "wl-history-size" }, fmtNum(r.size) + " 字符")
-                    : null
-                )
-              )
-            )
+                  h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
+                  h("span", null, g.month),
+                  h("span", { className: "wl-history-month-n" }, g.rows.length + " 份")
+                ),
+                show
+                  ? h(
+                      "ul",
+                      { className: "wl-history-list" },
+                      g.rows.map((r) =>
+                        h(
+                          "li",
+                          {
+                            key: r.rel,
+                            className: currentKey === r.key + "|" + r.mode ? "is-current" : "",
+                          },
+                          h(
+                            "button",
+                            {
+                              className: "wl-history-row" + (viewingRel === r.rel ? " is-viewing" : ""),
+                              "aria-current": viewingRel === r.rel ? "true" : undefined,
+                              disabled: busy,
+                              title: busy ? "生成完成后才能查看" : "查看 " + r.rel,
+                              onClick: () => void openReportEntry(r),
+                            },
+                            h("span", { className: "wl-history-date" }, r.from === r.to ? r.from : r.from + " 至 " + r.to),
+                            h("span", { className: "wl-history-tone" }, toneLabel(r.mode)),
+                            typeof r.size === "number" && r.size > 0
+                              ? h("span", { className: "wl-history-size" }, fmtNum(r.size) + " 字符")
+                              : null
+                          )
+                        )
+                      )
+                    )
+                  : null
+              );
+            })
           )
         : h("p", { className: "wl-history-empty" }, "还没有保存过报告。生成后点「保存」就会出现在这里。")
       : null
+  );
+}
+
+/**
+ * 历史报告只读查看器。
+ *
+ * 刻意做成浮层而不是塞进右侧面板：那块地方是「生成」的工作台，正在写的草稿
+ * 不该因为看一眼旧报告就消失。浮层只管看，想接着改再点「在面板中打开」。
+ */
+function ReportViewer() {
+  const R = appCtx.react;
+  const snap = useSnap();
+  const v = snap.viewer;
+  const closeRef = R.useRef(null);
+
+  // 打开时把焦点放到关闭按钮：键盘用户不用先 Tab 一圈才逃得出去
+  R.useEffect(() => {
+    if (!v) return;
+    const el = closeRef.current;
+    if (el && typeof el.focus === "function") el.focus();
+  }, [v ? v.rel : null]);
+
+  // Esc 关闭。挂在 document 上，焦点在浮层里任意位置都能收到
+  R.useEffect(() => {
+    if (!v || typeof document === "undefined") return;
+    const onKey = (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeViewer();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [v ? v.rel : null]);
+
+  if (!v) return null;
+
+  const title = v.from === v.to ? v.from : v.from + " 至 " + v.to;
+  const body = v.loading
+    ? h("p", { className: "wl-viewer-note" }, "正在读取…")
+    : v.error
+      ? h("p", { className: "wl-viewer-note is-error" }, "读取失败：" + v.error)
+      : v.text.trim()
+        ? h("div", { className: "wl-md wl-viewer-md" }, renderMarkdown(v.text))
+        : h("p", { className: "wl-viewer-note" }, "这份报告是空的。");
+
+  return h(
+    "div",
+    {
+      className: "wl-viewer-mask",
+      // 点遮罩关闭；点在浮层本体上时 stopPropagation 拦下
+      onClick: () => closeViewer(),
+    },
+    h(
+      "div",
+      {
+        className: "wl-viewer",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": "查看报告 " + title,
+        onClick: (ev) => ev.stopPropagation(),
+      },
+      h(
+        "div",
+        { className: "wl-viewer-head" },
+        h("h2", { className: "wl-viewer-title" }, title),
+        h("span", { className: "wl-viewer-tone" }, toneLabel(v.mode)),
+        typeof v.size === "number" && v.size > 0
+          ? h("span", { className: "wl-viewer-size" }, fmtNum(v.size) + " 字符")
+          : null,
+        h("span", { className: "wl-spacer" }),
+        h(
+          "button",
+          {
+            className: "wl-btn",
+            ref: closeRef,
+            title: "关闭（Esc）",
+            onClick: () => closeViewer(),
+          },
+          "关闭"
+        )
+      ),
+      h("div", { className: "wl-viewer-body" }, body),
+      h(
+        "div",
+        { className: "wl-viewer-foot" },
+        h("span", { className: "wl-viewer-path", title: v.rel }, v.rel),
+        h("span", { className: "wl-spacer" }),
+        h(
+          "button",
+          {
+            className: "wl-btn",
+            title: "把这份报告装进右侧面板，改完再保存",
+            disabled: v.loading || !!v.error,
+            onClick: () => void openViewerInPanel(),
+          },
+          "在面板中打开"
+        )
+      )
+    )
   );
 }
 
@@ -3730,7 +4012,9 @@ function CenterTab() {
         ),
         h(ReportPanel)
       )
-    )
+    ),
+    // 浮层挂在最外层：遮罩要盖住整页，不被 .wl-wrap 的宽度与间距裁掉
+    h(ReportViewer)
   );
 }
 
