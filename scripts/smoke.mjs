@@ -118,6 +118,12 @@ let refIdx = 0;
 let effectIdx = 0;
 const refs = [];
 const pendingEffects = [];
+// hook 槽位按「组件实例」分域，不能整棵树共用一个序号：
+// 真实 React 按 fiber 存状态，兄弟组件多一个少一个都不影响别人；
+// 全局序号则会——扫描前后会话卡片数量变化，后面 ReportPanel 的槽位整体后移，
+// useState 读到别人的值（draft 变成布尔值之类）。
+let domain = "root";
+let domainSeq = new Map();
 // effect 记录按组件分区：tab 与设置页的 effect 槽位不能互相覆盖
 const effectStores = new WeakMap();
 let effectStore = new Map();
@@ -125,7 +131,7 @@ let effectStore = new Map();
 const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props, children }),
   useState: (init) => {
-    const i = stateIdx++;
+    const i = domain + "|" + stateIdx++;
     if (!states.has(i)) states.set(i, typeof init === "function" ? init() : init);
     return [
       states.get(i),
@@ -136,7 +142,7 @@ const fakeReact = {
     pendingEffects.push({ i: effectIdx++, fn, deps });
   },
   useRef: (init) => {
-    const i = refIdx++;
+    const i = domain + "|" + refIdx++;
     if (!refs[i]) refs[i] = { current: init === undefined ? null : init };
     return refs[i];
   },
@@ -195,12 +201,25 @@ function useStoreFor(comp) {
 }
 
 // React 会调用函数组件，替身也要展开，否则拿到的只是 {type: Comp} 外壳。
+// 每个函数组件进入自己的域：同名组件按出现顺序编号（SessionBlock#0、#1…），
+// 每次 pass 重排。这样兄弟组件增删不会让后面组件的槽位整体错位。
 function expand(node) {
   if (Array.isArray(node)) return node.map(expand);
   if (!node || typeof node !== "object") return node;
   if (typeof node.type === "function") {
+    const nm = node.type.name || "anon";
+    const inst = domainSeq.get(nm) || 0;
+    domainSeq.set(nm, inst + 1);
+    const prev = { domain, stateIdx, refIdx };
+    domain = nm + "#" + inst;
+    stateIdx = 0;
+    refIdx = 0;
     const props = Object.assign({}, node.props || {}, { children: node.children || [] });
-    return expand(node.type(props));
+    const out = node.type(props);
+    domain = prev.domain;
+    stateIdx = prev.stateIdx;
+    refIdx = prev.refIdx;
+    return expand(out);
   }
   return Object.assign({}, node, { children: (node.children || []).map(expand) });
 }
@@ -219,6 +238,8 @@ function renderFresh(comp, props, opts) {
   stateIdx = 0;
   refIdx = 0;
   effectIdx = 0;
+  domain = "root";
+  domainSeq = new Map();
   pendingEffects.length = 0;
   const tree = expand(comp(props || {}));
   if (opts && opts.effects) flushEffects();
@@ -237,6 +258,8 @@ function renderKeep(comp, props) {
     stateIdx = 0;
     refIdx = 0;
     effectIdx = 0;
+    domain = "root";
+    domainSeq = new Map();
     pendingEffects.length = 0;
     tree = expand(comp(props || {}));
     let changed = before.size !== states.size;
@@ -782,6 +805,34 @@ check("切回日报后内容与磁盘一致", () => {
   assert.equal(a.props.value, "日报未保存的草稿");
 });
 
+// 草稿落盘的深度：切视图只在内存里留一份，插件热重载或重启就全没了。
+// 写到一半关掉宿主，回来还得是那份——这条路径只能靠 ctx.storage 兜住。
+const draftArea = byClass(renderKeep(tabDef.component), "wl-textarea");
+check("未保存草稿会写进 storage", () => {
+  assert.ok(draftArea, "应有编辑区");
+});
+draftArea.props.onChange({ target: { value: "# 重启前的日报草稿\n- 写到一半关掉了宿主\n" } });
+// 防抖 400ms：等它真的写进 storage 再模拟重启
+await sleep(700);
+check("storage 里能读到这份草稿", () => {
+  const raw = storageData.get("worklog.drafts.v1");
+  assert.ok(raw && Array.isArray(raw.entries), "应有草稿记录");
+  const key = DATE + "|daily";
+  const hit = raw.entries.find((e) => e.key === key);
+  assert.ok(hit, "应记下「" + key + "」，实际：" + raw.entries.map((e) => e.key).join(" / "));
+  assert.match(hit.text, /重启前的日报草稿/);
+});
+// 模拟插件热重载：重新 activate 一个全新的模块实例，内存 Map 从零开始
+const freshMod = await import(PLUGIN + "?reload=" + Date.now());
+const disposeReload = freshMod.default(ctx);
+await sleep(400);
+check("重新激活后草稿没有丢", () => {
+  const a = byClass(renderFresh(tabDef.component), "wl-textarea");
+  assert.ok(a, "应回到编辑区");
+  assert.match(a.props.value, /重启前的日报草稿/, "应把上次没保存的草稿读回来");
+  assert.match(textOf(renderFresh(tabDef.component)), /有未保存的修改/);
+});
+
 // 恢复后续用例期望的报告内容
 byClass(renderKeep(tabDef.component), "wl-textarea").props.onChange({
   target: { value: "手动保存的内容" },
@@ -1174,11 +1225,25 @@ check("多日报告写进 from_to 文件名", () => {
 });
 
 // 回到单日，再从历史点回这份周报
+const nodeCallsBeforeRestore = execCalls.filter((c) => c.bin === "node").length;
 findByText(renderFresh(tabDef.component), "单日").props.onClick();
 await sleep(80);
 check("切回单日后范围回到今天", () => {
   const t = textOf(renderFresh(tabDef.component));
   assert.ok(!t.includes(monday + " 至 " + DATE), "不应还显示多日范围");
+});
+
+// 今天已经扫过一次：切回来时快照直接摆出来，不用再点「扫描」。
+// 关掉宿主再打开也是这条路径——JSONL 早就写在 runtime/ 里了。
+await waitFor(() => textOf(renderFresh(tabDef.component)).includes("来源核对"), 3000);
+check("切回已扫过的范围时自动读回快照", () => {
+  const t = textOf(renderFresh(tabDef.component));
+  assert.match(t, /来源核对/, "应直接展示上次的扫描结果");
+  assert.match(t, /1 个会话/, "内容应来自当天那份快照");
+  // 读回来的没有本次耗时：「耗时 0 秒」会让人以为刚扫完
+  assert.match(t, /上次扫描 \d{2}:\d{2}/, "应标明这是上次扫描的时间");
+  const nodeCallsNow = execCalls.filter((c) => c.bin === "node").length;
+  assert.equal(nodeCallsNow, nodeCallsBeforeRestore, "读快照不该再跑一次扫描器");
 });
 
 // 单日范围下选周报：允许点，但要说清「本周产出 / 下周安排」会很空
@@ -1370,6 +1435,149 @@ check("从查看器在面板中打开这份报告", () => {
   assert.ok(area, "应显示报告内容");
   assert.match(area.props.value, /本周周报/);
 });
+
+/* ------------------------------------------------------ 历史搜索与删除 */
+
+// 总共才几份时搜索框没必要占地方；造几份跨月的报告，让行数过门槛
+for (const d of ["2026-08-14", "2026-08-13", "2026-07-09", "2026-07-08"]) {
+  fs.writeFileSync(path.join(storageDir, "reports", d + "-retro.md"), "# 旧复盘 " + d + "\n", "utf8");
+}
+fs.writeFileSync(path.join(storageDir, "reports", "2026-06-20-daily.md"), "# 旧日报\n", "utf8");
+
+const historyRowsNow = (t) => {
+  const out = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-row")) out.push(n);
+  });
+  return out;
+};
+const historySearchInput = (t) => {
+  const box = byClass(t, "wl-history-search");
+  let input = null;
+  if (box) walk(box, (n) => {
+    if (!input && n.type === "input") input = n;
+  });
+  return input;
+};
+// 一行里有「查看」和「删除」两个按钮，按行文本取到这两块
+function historyRowPair(t, needle) {
+  let hit = null;
+  walk(t, (n) => {
+    if (hit || n.type !== "li") return;
+    const kids = (n.children || []).filter((c) => c && typeof c === "object" && c.type);
+    const isCls = (c, cls) =>
+      typeof (c.props || {}).className === "string" && c.props.className.split(/\s+/).includes(cls);
+    const row = kids.find((c) => isCls(c, "wl-history-row"));
+    if (!row || !textOf(row).includes(needle)) return;
+    hit = { row: row, del: kids.find((c) => isCls(c, "wl-history-del")) };
+  });
+  return hit;
+}
+
+// 确保历史是展开的：收起时列表整个不渲染
+if (!byClass(renderKeep(tabDef.component), "wl-history-body")) {
+  findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+  await sleep(150);
+}
+// 收起再展开，触发重新读盘（组件只在 open 由假变真时读）
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+await sleep(120);
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+await waitFor(() => historyRowsNow(renderKeep(tabDef.component)).length >= 8, 3000);
+
+check("报告多了以后提供历史过滤框", () => {
+  assert.ok(historySearchInput(renderKeep(tabDef.component)), "应有过滤输入框");
+});
+
+const filterHistory = async (kw) => {
+  historySearchInput(renderKeep(tabDef.component)).props.onChange({ target: { value: kw } });
+  await sleep(60);
+};
+await filterHistory("复盘");
+check("历史过滤只留下匹配的报告", () => {
+  const rows = historyRowsNow(renderKeep(tabDef.component));
+  assert.ok(rows.length >= 1, "应还剩复盘报告");
+  const wrong = rows.filter((r) => !textOf(r).includes("个人复盘"));
+  assert.equal(wrong.length, 0, "应只剩复盘，实际还有：" + wrong.map((r) => textOf(r)).join(" / "));
+});
+check("过滤时月份全部摊开", () => {
+  const t = renderKeep(tabDef.component);
+  const months = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-month")) months.push(n);
+  });
+  assert.ok(months.length >= 1, "应有月份分组");
+  assert.ok(
+    months.every((m) => m.props["aria-expanded"] === "true" && m.props.disabled),
+    "过滤时应展开并且不允许再折叠"
+  );
+});
+
+await filterHistory("不存在的口吻");
+check("过滤无结果时说明并给出一键清空", () => {
+  const t = renderKeep(tabDef.component);
+  assert.match(textOf(t), /没有匹配「不存在的口吻」的报告/);
+  assert.ok(findByText(t, "清空过滤"), "应能一键清空");
+});
+findByText(renderKeep(tabDef.component), "清空过滤").props.onClick();
+await sleep(60);
+check("清空过滤后恢复全部报告", () => {
+  const t = renderKeep(tabDef.component);
+  assert.equal(historySearchInput(t).props.value, "", "过滤词应被清空");
+  const months = [];
+  walk(t, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("wl-history-month")) months.push(n);
+  });
+  assert.ok(months.length >= 4, "几个月都应回来，实际 " + months.length);
+  // 回到默认态：最新月展开、更早的收起，月份按钮重新可点
+  assert.equal(months[0].props["aria-expanded"], "true");
+  assert.equal(months[1].props["aria-expanded"], "false");
+  assert.ok(months.every((m) => !m.props.disabled), "月份应能重新折叠");
+});
+
+// 删除：不可撤销，所以要两次点击；筛到目标月份，免得被折叠挡住
+await filterHistory("2026-08");
+const delTarget = "2026-08-14";
+const delPath = path.join(storageDir, "reports", delTarget + "-retro.md");
+check("历史行提供删除入口", () => {
+  const pair = historyRowPair(renderKeep(tabDef.component), delTarget);
+  assert.ok(pair && pair.del, "每行应有删除按钮");
+});
+historyRowPair(renderKeep(tabDef.component), delTarget).del.props.onClick();
+await sleep(60);
+check("第一次点删除只是等确认", () => {
+  const pair = historyRowPair(renderKeep(tabDef.component), delTarget);
+  assert.equal(textOf(pair.del), "确认删除", "应变成确认态");
+  assert.ok(fs.existsSync(delPath), "第一次点击不该真删");
+});
+// 宿主写盘会留一份 .bak，删报告时得一起清掉
+fs.writeFileSync(delPath + ".bak", "old", "utf8");
+historyRowPair(renderKeep(tabDef.component), delTarget).del.props.onClick();
+await sleep(300);
+check("确认后真的删掉这份报告", () => {
+  assert.equal(fs.existsSync(delPath), false, "文件应被删除");
+  assert.equal(fs.existsSync(delPath + ".bak"), false, "宿主留下的 .bak 也该清掉");
+  const rows = historyRowsNow(renderKeep(tabDef.component));
+  assert.equal(rows.some((r) => textOf(r).includes(delTarget)), false, "列表里也不该再有");
+});
+// 先让某一行进入确认态再收起，重新展开不该还停在一键即删
+const remainBefore = historyRowPair(renderKeep(tabDef.component), "2026-08-13");
+remainBefore.del.props.onClick();
+await sleep(60);
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+await sleep(60);
+findByText(renderKeep(tabDef.component), "报告历史").props.onClick();
+await sleep(200);
+check("收起历史时清掉待确认状态", () => {
+  const pair = historyRowPair(renderKeep(tabDef.component), "2026-08-13");
+  assert.ok(pair, "重新展开后应还在");
+  assert.equal(textOf(pair.del), "删除", "不该还停在确认态");
+});
+findByText(renderKeep(tabDef.component), "清空").props.onClick();
+await sleep(60);
 
 /* ------------------------------------------------------ 自定义口吻 */
 

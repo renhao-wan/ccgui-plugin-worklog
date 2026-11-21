@@ -60,6 +60,11 @@ const TONE_ID_RE = /^[a-z][a-z0-9]{0,15}$/;
 const RESERVED_TONE_IDS = Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase());
 // 报告历史只给最近这么多份读大小；再多的只靠文件名列出，避免开个面板读上百个文件
 const MAX_REPORT_LIST_READ = 40;
+// 未保存草稿的持久化：只留最近这么多份、总长不超过这个数，避免 storage 无限增长
+const DRAFTS_KEY = "worklog.drafts.v1";
+const MAX_DRAFT_ENTRIES = 20;
+const MAX_DRAFT_CHARS = 200000;
+const DRAFT_PERSIST_DELAY_MS = 400;
 // 自定义范围一次最多看这么多天：再长就接近扫全库，node 子进程会超时，
 // 界面上也会长时间停在「扫描中」。
 const MAX_RANGE_DAYS = 92;
@@ -603,6 +608,34 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 }
 .wl-history-scroll:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
 .wl-history-list { list-style:none; margin:0; padding:0 0 6px; }
+/* 搜索行留在滚动区外面：翻到列表深处时，换关键词不用先滚回顶部 */
+.wl-history-search {
+  display:flex; align-items:center; gap:8px;
+  padding:8px 14px; border-top:1px solid var(--wl-rule);
+}
+.wl-history-search .wl-input { flex:1 1 auto; min-width:0; height:30px; font-size:12px; }
+/* 行里有两块可点区域：左边查看、右边删除。li 负责横排，两个按钮各自是相邻兄弟 */
+.wl-history-list li {
+  display:flex; align-items:center; gap:0;
+  border-bottom:1px solid transparent;
+}
+.wl-history-list li:hover { background:var(--wl-raised); }
+.wl-history-del {
+  flex:none; height:100%; min-height:30px; padding:0 10px;
+  border:0; background:transparent; color:var(--wl-faint);
+  font:inherit; font-size:11px; cursor:pointer; white-space:nowrap;
+  opacity:0; transition:opacity .12s ease;
+}
+/* 平时不显眼：删除是低频且不可撤销的操作，不该和「查看」抢注意力。
+ * 悬停行、键盘聚焦到它时再露出来。 */
+.wl-history-list li:hover .wl-history-del,
+.wl-history-del:focus-visible { opacity:1; }
+.wl-history-del:hover:not(:disabled) { color:var(--wl-negative); }
+.wl-history-del:disabled { opacity:.4; cursor:not-allowed; }
+/* 已经点过一次、等待确认：常显 + 红色，让「再点一次就没了」足够清楚 */
+.wl-history-del.is-confirm {
+  opacity:1; color:var(--wl-neg-ink); background:var(--wl-neg-bg); font-weight:500;
+}
 /* 月份标题本身可折叠：点它展开/收起这一组。
  * 粘在滚动区顶部：同时展开几个月往下翻时，始终知道自己在哪个月。 */
 .wl-history-month {
@@ -618,14 +651,15 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-history-month-n { margin-left:auto; color:var(--wl-faint); }
 .wl-history-group + .wl-history-group .wl-history-month { border-top:1px solid var(--wl-rule); }
 .wl-history-row {
-  display:flex; align-items:center; gap:10px; width:100%;
+  display:flex; align-items:center; gap:10px; flex:1 1 auto; min-width:0;
   padding:7px 14px; border:0; background:transparent; color:var(--wl-text);
   font:inherit; font-size:12px; text-align:left; cursor:pointer;
 }
-.wl-history-row:hover:not(:disabled) { background:var(--wl-raised); }
+/* 行的背景交给 li：右侧还有删除按钮，只给左边上色会让整行断成两截 */
+.wl-history-row:hover:not(:disabled) { background:transparent; }
 .wl-history-row:focus-visible { outline:2px solid var(--wl-accent); outline-offset:-2px; }
 .wl-history-row:disabled { opacity:.5; cursor:not-allowed; }
-.wl-history-list li.is-current .wl-history-row { background:var(--wl-raised); }
+.wl-history-list li.is-current { background:var(--wl-raised); }
 .wl-history-list li.is-current .wl-history-date { font-weight:500; }
 /* 正在浮层里看的那份：左侧加一条竖线，和「当前面板里的那份」区分开 */
 .wl-history-row.is-viewing { box-shadow:inset 2px 0 0 var(--wl-accent); }
@@ -957,6 +991,19 @@ function hhmm(iso) {
   return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
 }
 
+/**
+ * 扫描时间戳压缩成界面能读的一小段：今天只给时刻，更早的带上日期。
+ * 快照是从磁盘读回来的，没有本次耗时，「耗时 0 秒」会让人以为刚扫完。
+ */
+function shortStamp(iso) {
+  const t = Date.parse(iso || "");
+  if (!Number.isFinite(t)) return "";
+  const d = new Date(t);
+  const day = d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  const hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  return day === todayStr() ? hm : day.slice(5) + " " + hm;
+}
+
 function clip(text, max) {
   const s = String(text == null ? "" : text);
   if (s.length <= max) return s;
@@ -1021,6 +1068,10 @@ const store = {
     reportListLoading: false,
     // 列目录失败的原因；和「确实没有报告」分开，否则一次读盘失败看着像自己没存
     reportListError: "",
+    // 历史列表的过滤词：按日期或口吻名筛。空串表示不过滤。
+    historyFilter: "",
+    // 历史里待确认删除的那份（rel）；null 表示没有在确认
+    pendingDelete: null,
     // 历史报告查看器：null 表示没打开。点历史里的某一份只在这里看，
     // 不占用右侧生成面板——那块地方归「生成」用，看过往报告不该把当前草稿替换掉。
     viewer: null,
@@ -1278,6 +1329,41 @@ async function scanRange(range) {
     throw new Error("扫描结果来自 " + engineLabel(facts.engine) + "，当前只能解析 " + SCAN_ENGINE_LABEL + " 的日志");
   }
   facts._elapsedMs = Date.now() - started;
+  return facts;
+}
+
+/**
+ * 读回某个范围上一次扫描的快照（scanRange 写进 runtime/facts-<范围>.json 的那份）。
+ *
+ * 只写不读的话，关掉宿主再打开，扫描区就是空的——明明早上刚扫过。
+ * 读失败一律当作「没有快照」，不能拦住启动。
+ */
+async function loadFactsSnapshot(range) {
+  if (!appCtx) return null;
+  const key = rangeKey(normalizeRange(range));
+  const rel = "runtime/facts-" + key + ".json";
+  let doc = null;
+  try {
+    doc = await appCtx.documentStorage.readText(rel);
+  } catch (e) {
+    return null;
+  }
+  if (!doc || typeof doc.content !== "string" || !doc.content) return null;
+  let facts = null;
+  try {
+    facts = JSON.parse(doc.content);
+  } catch (e) {
+    return null;
+  }
+  if (!facts || typeof facts !== "object" || !facts.totals) return null;
+  // 快照可能来自另一个扫描引擎版本：认不出来就当没有
+  if (facts.engine && facts.engine !== SCAN_ENGINE_ID) return null;
+  if (facts.range && (facts.range.from !== normalizeRange(range).from || facts.range.to !== normalizeRange(range).to)) {
+    return null;
+  }
+  // 这一份是从磁盘读回来的，不是刚跑出来的：没有真实耗时
+  facts._elapsedMs = 0;
+  facts._restored = true;
   return facts;
 }
 
@@ -1612,6 +1698,34 @@ async function pruneOldFacts(keepDays) {
   }
 }
 
+/** 扫完之后跑 git 对账并更新 store。抽出来给 doScan 和快照恢复后的补核对共用。 */
+async function reconcileGit(facts, range) {
+  if (!store.snap.settings.gitReconcile || !facts.workspaces || !facts.workspaces.length) return;
+  const key = rangeKey(range);
+  set({ rechecking: true });
+  const groups = facts.workspaces.filter(
+    (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
+  );
+  // 限并发：每个工作区要跑 3 条 git 命令，一次全开容易压垮进程创建
+  const gitRange = facts.range && facts.range.from ? facts.range : range;
+  const results = await mapLimit(groups, GIT_CONCURRENCY, (group) =>
+    gitForWorkspace(group.workspace, gitRange).catch((e) => ({
+      workspace: group.workspace,
+      isRepo: false,
+      commits: [],
+      dirty: [],
+      error: safeError(e),
+    }))
+  );
+  if (rangeKey(store.snap.range) !== key) {
+    // 结果属于旧范围：丢弃。但 rechecking 要收回来——扫描按钮的 disabled
+    // 里有它，留着不放会让按钮一直点不动。
+    set({ rechecking: false });
+    return;
+  }
+  set({ git: results, rechecking: false });
+}
+
 async function doScan() {
   if (store.snap.scanning) return;
   const range = normalizeRange(store.snap.range);
@@ -1628,25 +1742,7 @@ async function doScan() {
     set({ facts: facts, mutedWorkspaces: [] });
     void pruneOldFacts();
 
-    if (store.snap.settings.gitReconcile && facts.workspaces && facts.workspaces.length) {
-      set({ rechecking: true });
-      const groups = facts.workspaces.filter(
-        (group) => group.workspace && group.workspace !== UNKNOWN_WORKSPACE
-      );
-      // 限并发：每个工作区要跑 3 条 git 命令，一次全开容易压垮进程创建
-      const gitRange = facts.range && facts.range.from ? facts.range : range;
-      const results = await mapLimit(groups, GIT_CONCURRENCY, (group) =>
-        gitForWorkspace(group.workspace, gitRange).catch((e) => ({
-          workspace: group.workspace,
-          isRepo: false,
-          commits: [],
-          dirty: [],
-          error: safeError(e),
-        }))
-      );
-      if (rangeKey(store.snap.range) !== key) return;
-      set({ git: results, rechecking: false });
-    }
+    await reconcileGit(facts, range);
 
     const saved = await loadReportIntoCache(range, mode);
     if (rangeKey(store.snap.range) !== key || store.snap.reportMode !== mode) return;
@@ -1677,17 +1773,88 @@ async function loadSavedReport(range, mode) {
 }
 
 /* 每个「范围+口吻」各留一份磁盘文本和一份未保存草稿：
-   切换口吻或范围时内容不会互相覆盖，切回来还能接着改。缓存只在内存里，不写盘。 */
+   切换口吻或范围时内容不会互相覆盖，切回来还能接着改。
+   草稿另外写进 storage（reportDraftText 的内存副本是真相，storage 只是兜底）：
+   插件热重载或重启后模块重新加载，光靠内存会让写了一半的报告无声消失。 */
 const REPORT_KEY = (range, mode) => rangeKey(range) + "|" + mode;
 const reportDiskText = new Map();
 const reportDraftText = new Map();
+
+// 落盘草稿的内容；只留最近若干份、总长有上限，避免 storage 越滚越大
+let draftSaveTimer = null;
+function draftPayload() {
+  const entries = [];
+  for (const [key, text] of reportDraftText) {
+    if (!text || !text.trim()) continue;
+    entries.push({ key: key, text: text });
+  }
+  // 新的在前（Map 的插入顺序就是最近一次写入的顺序），从新到旧累计到预算用完
+  entries.reverse();
+  const kept = [];
+  let total = 0;
+  for (const e of entries) {
+    if (kept.length >= MAX_DRAFT_ENTRIES) break;
+    if (total + e.text.length > MAX_DRAFT_CHARS) break;
+    kept.push(e);
+    total += e.text.length;
+  }
+  return { v: 1, entries: kept };
+}
+
+/** 把内存里的草稿写进 storage。连续输入时只写最后一次。 */
+function persistDraftsSoon() {
+  if (!appCtx || !appCtx.storage || typeof appCtx.storage.set !== "function") return;
+  if (draftSaveTimer) clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(() => {
+    draftSaveTimer = null;
+    try {
+      void Promise.resolve(appCtx.storage.set(DRAFTS_KEY, draftPayload())).catch(() => {});
+    } catch (e) {
+      /* 存不下只影响下次启动能否恢复，不影响当前编辑 */
+    }
+  }, DRAFT_PERSIST_DELAY_MS);
+}
+
+/** 启动时把上次没保存的草稿读回来。读失败就当作没有草稿，不能拦住启动。 */
+async function loadPersistedDrafts() {
+  if (!appCtx || !appCtx.storage || typeof appCtx.storage.get !== "function") return;
+  let raw = null;
+  try {
+    raw = await appCtx.storage.get(DRAFTS_KEY);
+  } catch (e) {
+    return;
+  }
+  const entries = raw && Array.isArray(raw.entries) ? raw.entries : [];
+  for (const e of entries) {
+    if (!e || typeof e.key !== "string" || typeof e.text !== "string") continue;
+    if (!e.text.trim()) continue;
+    // 内存里已经有更新的版本就不覆盖
+    if (!reportDraftText.has(e.key)) reportDraftText.set(e.key, e.text);
+  }
+}
+
+/** 记一份草稿（编辑中按内容调用）。空文本或与磁盘一致就不留。 */
+function noteDraft(range, mode, text) {
+  const key = REPORT_KEY(range, mode);
+  const saved = reportDiskText.has(key) ? reportDiskText.get(key) : "";
+  rememberDraft(key, text && text.trim() && text !== saved ? text : "");
+  persistDraftsSoon();
+}
+
+/** 写入草稿；先删再插，让 Map 的插入顺序真的等于「最近一次编辑」。 */
+function rememberDraft(key, text) {
+  // Map.set 对已有 key 不会挪位置，直接 set 会让很久没碰的草稿排在前面，
+  // 落盘裁剪时反而先把它留下、把新写的挤掉
+  reportDraftText.delete(key);
+  if (text) reportDraftText.set(key, text);
+}
 
 /** 把当前视图的未保存草稿记进内存；已保存的内容不重复存。 */
 function stashReportDraft() {
   const key = REPORT_KEY(store.snap.range, store.snap.reportMode);
   const text = store.snap.report || "";
-  if (text.trim() && text !== store.snap.reportSaved) reportDraftText.set(key, text);
-  else reportDraftText.delete(key);
+  rememberDraft(key, text.trim() && text !== store.snap.reportSaved ? text : "");
+  persistDraftsSoon();
 }
 
 /** 读磁盘内容并更新缓存，返回文本。 */
@@ -1805,6 +1972,8 @@ async function saveReportText(range, mode, text) {
   await removeDoc(rel + ".bak");
   reportDiskText.set(REPORT_KEY(range, mode), text);
   reportDraftText.delete(REPORT_KEY(range, mode));
+  // 保存成功后草稿就没用了：同步把 storage 里那份也清掉
+  persistDraftsSoon();
 }
 
 /** 切换范围或口吻时不写盘；未保存的修改留在内存里，切回来还能继续编辑。 */
@@ -2544,6 +2713,32 @@ async function changeRange(next, preset) {
   };
   if (pick === "custom") extra.rangeDraft = range;
   await switchView(range, store.snap.reportMode, extra);
+  // 切到这个范围如果之前扫过，直接把快照摆出来：不用再点一次「扫描」。
+  // 只在用户还没等到新一轮扫描结果时才填（scanning 时不抢先）。
+  void restoreFactsFor(range);
+}
+
+/**
+ * 把某个范围内已存的扫描快照放回界面（如果存在）。
+ * 只补「空的」那一屏：用户已经主动扫出结果时不能覆盖。
+ */
+async function restoreFactsFor(range) {
+  const r = normalizeRange(range);
+  const key = rangeKey(r);
+  if (store.snap.scanning) return;
+  if (store.snap.facts) {
+    // 已经有一份属于这个范围的结果（例如刚扫完），不用再读盘
+    const cur = store.snap.facts.range;
+    if (cur && cur.from === r.from && cur.to === r.to) return;
+  }
+  const facts = await loadFactsSnapshot(r);
+  if (!facts) return;
+  // 读盘期间用户可能又换了范围
+  if (rangeKey(store.snap.range) !== key || store.snap.scanning) return;
+  if (store.snap.facts) return;
+  set({ facts: facts, mutedWorkspaces: [] });
+  // git 结果没有跟着快照存：补跑一次，否则「未提交改动」那块是空的
+  await reconcileGit(facts, r);
 }
 
 /** 预设按钮：单日 = 今天，本周 = 本周一至今天，自定义 = 保留当前范围并展开两个日期框。 */
@@ -2972,7 +3167,10 @@ function FactsView(props) {
       "来源核对：" + facts.totals.filesScanned + " 个会话文件 · " +
       facts.totals.sessions + " 个会话 · " +
       (facts.totals.filesFailed ? "读取失败 " + facts.totals.filesFailed + " 个" : "失败 0") +
-      " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—") +
+      // 从快照读回来的没有本次耗时：说清是上次扫的，别让人误以为刚扫完
+      (facts._restored
+        ? " · 上次扫描 " + shortStamp(facts.scannedAt)
+        : " · 耗时 " + (facts._elapsedMs ? (facts._elapsedMs / 1000).toFixed(1) + " 秒" : "—")) +
       (snap.rechecking ? " · 正在核对 git…" : "")
     ),
     mutedNames.length
@@ -3511,7 +3709,12 @@ function ReportPanel() {
                 className: "wl-textarea",
                 value: draft,
                 spellCheck: false,
-                onChange: (e) => setDraft(e.target.value),
+                onChange: (e) => {
+                  setDraft(e.target.value);
+                  // 输入就记一份：插件热重载发生在「正在写」的时候，只靠切视图时
+                  // 的 stash 会丢掉最后一段。防抖在 persistDraftsSoon 里做。
+                  noteDraft(store.snap.range, store.snap.reportMode, e.target.value);
+                },
                 onBlur: commit,
                 placeholder: "报告会出现在这里，可以直接修改。",
               })
@@ -3658,6 +3861,8 @@ async function openReportEntry(entry) {
   const mode = String(entry.mode || "");
   // 先开浮层并把标题等元信息填上，正文随后异步补：点下去立刻有反应
   set({
+    // 去查看别的报告，就别让某一行继续停在「再点一次就删」的状态
+    pendingDelete: null,
     viewer: {
       rel: entry.rel,
       from: range.from,
@@ -3688,7 +3893,48 @@ async function openReportEntry(entry) {
 
 /** 关掉查看器。 */
 function closeViewer() {
-  if (store.snap.viewer) set({ viewer: null });
+  if (store.snap.viewer) set({ viewer: null, pendingDelete: null });
+}
+
+/* ------------------------------------------------------------ 删除报告 */
+
+/**
+ * 删除一份已保存的报告。
+ *
+ * 只删 `reports/` 下这一个文件，不碰别的；删之前要经过一次确认
+ * （`pendingDelete` 记着待删的 rel），因为这是插件里唯一不可撤销的操作。
+ */
+async function deleteReport(entry) {
+  if (!entry || !entry.rel) return;
+  const rel = entry.rel;
+  try {
+    await appCtx.documentStorage.remove(rel);
+  } catch (e) {
+    // remove 对不存在的文件可能抛错；那也算删掉了
+    if (!/not found|不存在|ENOENT/i.test(String(e && e.message))) {
+      set({ error: "删除报告失败：" + safeError(e) });
+      flash("删除失败，文件还在");
+      set({ pendingDelete: null });
+      return;
+    }
+  }
+  // 宿主原子写入留下的 .bak 属于同一份报告，一起清掉
+  await removeDoc(rel + ".bak");
+  // 内存里那两份副本也要清掉，否则切回这个范围还会看到已删的内容
+  const key = REPORT_KEY({ from: entry.from, to: entry.to }, entry.mode);
+  reportDiskText.delete(key);
+  reportDraftText.delete(key);
+  persistDraftsSoon();
+  // 正在看的就是这份：关掉浮层
+  const cur = store.snap.viewer;
+  if (cur && cur.rel === rel) set({ viewer: null });
+  // 面板里现在装的正是这份报告：清空，避免用户以为它还存着
+  if (rangeKey(store.snap.range) === rangeKey({ from: entry.from, to: entry.to }) && store.snap.reportMode === entry.mode) {
+    set({ report: "", reportSaved: "" });
+  }
+  set({ pendingDelete: null });
+  flash("已删除 " + rel);
+  await loadReportList();
 }
 
 /** 把查看器里这份报告装进右侧面板，接着改。用户明确要求才做这一步。 */
@@ -3732,6 +3978,19 @@ function ReportHistory() {
   // 读取失败和「没有报告」是两件事：前者要说清原因，别让用户以为是自己没保存
   const listError = snap.reportListError || "";
   const viewingRel = snap.viewer ? snap.viewer.rel : "";
+  const pendingDelete = snap.pendingDelete || "";
+
+  // 过滤：按日期或口吻名匹配（「11-08」「周报」「个人复盘」都行）。
+  // 过滤时不折叠月份——正在找东西，每一组都摊开比多点几下强。
+  const filter = String(snap.historyFilter || "").trim().toLowerCase();
+  const matchRow = (r) => {
+    if (!filter) return true;
+    const probe = [r.from, r.to, r.from + " 至 " + r.to, r.mode, toneLabel(r.mode)]
+      .join(" ")
+      .toLowerCase();
+    return probe.includes(filter);
+  };
+  const filtered = rows.filter(matchRow);
 
   // 每个月的展开状态。没点过的月份走默认：最新一个月展开，更早的收起——
   // 报告攒到几个月时，先看到「有哪些月」，而不是把最老的那份也铺在眼前。
@@ -3751,12 +4010,16 @@ function ReportHistory() {
 
   // 已经按结束日倒序排过，这里只做相邻切分，不重新排序
   const groups = [];
-  for (const r of rows) {
+  for (const r of filtered) {
     const month = String(r.to || "").slice(0, 7);
     const last = groups[groups.length - 1];
     if (last && last.month === month) last.rows.push(r);
     else groups.push({ month: month, rows: [r] });
   }
+
+  const countText = filter
+    ? filtered.length + " / " + rows.length + " 份"
+    : rows.length + " 份" + (groups.length > 1 ? " · " + groups.length + " 个月" : "");
 
   return h(
     "section",
@@ -3770,6 +4033,8 @@ function ReportHistory() {
           setOpen(!open);
           // 每次展开都重新读一遍：报告可能在别的窗口里被改过
           if (!open) void loadReportList();
+          // 收起时清掉「等待确认删除」：下次打开不该还停在一键即删的状态
+          else if (store.snap.pendingDelete) set({ pendingDelete: null });
         },
       },
       h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
@@ -3782,7 +4047,7 @@ function ReportHistory() {
           : listError
             ? "读取失败"
             : list
-              ? rows.length + " 份" + (groups.length > 1 ? " · " + groups.length + " 个月" : "")
+              ? countText
               : "点开查看已保存的报告"
       )
     ),
@@ -3792,56 +4057,123 @@ function ReportHistory() {
         : rows.length
         ? h(
             "div",
-            { className: "wl-history-scroll" },
-            groups.map((g, gi) => {
-              const show = isMonthOpen(g.month, gi);
-              return h(
-                "div",
-                { key: g.month, className: "wl-history-group" },
-                h(
-                  "button",
-                  {
-                    className: "wl-history-month",
-                    "aria-expanded": show ? "true" : "false",
-                    title: (show ? "收起 " : "展开 ") + g.month,
-                    onClick: () => toggleMonth(g.month, gi),
-                  },
-                  h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
-                  h("span", null, g.month),
-                  h("span", { className: "wl-history-month-n" }, g.rows.length + " 份")
-                ),
-                show
-                  ? h(
-                      "ul",
-                      { className: "wl-history-list" },
-                      g.rows.map((r) =>
-                        h(
-                          "li",
-                          {
-                            key: r.rel,
-                            className: currentKey === r.key + "|" + r.mode ? "is-current" : "",
-                          },
-                          h(
-                            "button",
-                            {
-                              className: "wl-history-row" + (viewingRel === r.rel ? " is-viewing" : ""),
-                              "aria-current": viewingRel === r.rel ? "true" : undefined,
-                              disabled: busy,
-                              title: busy ? "生成完成后才能查看" : "查看 " + r.rel,
-                              onClick: () => void openReportEntry(r),
-                            },
-                            h("span", { className: "wl-history-date" }, r.from === r.to ? r.from : r.from + " 至 " + r.to),
-                            h("span", { className: "wl-history-tone" }, toneLabel(r.mode)),
-                            typeof r.size === "number" && r.size > 0
-                              ? h("span", { className: "wl-history-size" }, fmtNum(r.size) + " 字符")
-                              : null
-                          )
-                        )
+            { className: "wl-history-body" },
+            // 报告多到需要折叠时，查找才是真需求；只有一两份就别占一行地方了
+            rows.length > 6
+              ? h(
+                  "div",
+                  { className: "wl-history-search" },
+                  h("input", {
+                    type: "search",
+                    className: "wl-input",
+                    value: snap.historyFilter || "",
+                    placeholder: "按日期或口吻找…",
+                    "aria-label": "过滤报告历史",
+                    onChange: (e) => set({ historyFilter: e.target.value }),
+                  }),
+                  filter
+                    ? h(
+                        "button",
+                        {
+                          className: "wl-btn ghost",
+                          title: "清空过滤",
+                          onClick: () => set({ historyFilter: "" }),
+                        },
+                        "清空"
                       )
-                    )
-                  : null
-              );
-            })
+                    : null
+                )
+              : null,
+            filtered.length
+              ? h(
+                  "div",
+                  { className: "wl-history-scroll" },
+                  groups.map((g, gi) => {
+                    // 过滤时全部摊开：用户正在找东西，收起只会多一次点击
+                    const show = filter ? true : isMonthOpen(g.month, gi);
+                    return h(
+                      "div",
+                      { key: g.month, className: "wl-history-group" },
+                      h(
+                        "button",
+                        {
+                          className: "wl-history-month",
+                          "aria-expanded": show ? "true" : "false",
+                          disabled: !!filter,
+                          title: filter ? g.month : (show ? "收起 " : "展开 ") + g.month,
+                          onClick: () => toggleMonth(g.month, gi),
+                        },
+                        filter
+                          ? null
+                          : h("span", { className: "wl-card-caret", "aria-hidden": "true" }),
+                        h("span", null, g.month),
+                        h("span", { className: "wl-history-month-n" }, g.rows.length + " 份")
+                      ),
+                      show
+                        ? h(
+                            "ul",
+                            { className: "wl-history-list" },
+                            g.rows.map((r) =>
+                              h(
+                                "li",
+                                {
+                                  key: r.rel,
+                                  className: currentKey === r.key + "|" + r.mode ? "is-current" : "",
+                                },
+                                h(
+                                  "button",
+                                  {
+                                    className: "wl-history-row" + (viewingRel === r.rel ? " is-viewing" : ""),
+                                    "aria-current": viewingRel === r.rel ? "true" : undefined,
+                                    disabled: busy,
+                                    title: busy ? "生成完成后才能查看" : "查看 " + r.rel,
+                                    onClick: () => void openReportEntry(r),
+                                  },
+                                  h("span", { className: "wl-history-date" }, r.from === r.to ? r.from : r.from + " 至 " + r.to),
+                                  h("span", { className: "wl-history-tone" }, toneLabel(r.mode)),
+                                  typeof r.size === "number" && r.size > 0
+                                    ? h("span", { className: "wl-history-size" }, fmtNum(r.size) + " 字符")
+                                    : null
+                                ),
+                                // 删除是不可撤销的：先点一次变成「确认删除」，再点才真删
+                                h(
+                                  "button",
+                                  {
+                                    className:
+                                      "wl-history-del" + (pendingDelete === r.rel ? " is-confirm" : ""),
+                                    disabled: busy,
+                                    title:
+                                      pendingDelete === r.rel
+                                        ? "再点一次就删除 " + r.rel
+                                        : "删除这份报告",
+                                    onClick: () => {
+                                      if (pendingDelete === r.rel) void deleteReport(r);
+                                      else set({ pendingDelete: r.rel });
+                                    },
+                                  },
+                                  pendingDelete === r.rel ? "确认删除" : "删除"
+                                )
+                              )
+                            )
+                          )
+                        : null
+                    );
+                  })
+                )
+              : h(
+                  "p",
+                  { className: "wl-history-empty" },
+                  "没有匹配「" + filter + "」的报告。",
+                  h(
+                    "button",
+                    {
+                      className: "wl-btn ghost",
+                      style: { marginLeft: "8px" },
+                      onClick: () => set({ historyFilter: "" }),
+                    },
+                    "清空过滤"
+                  )
+                )
           )
         : h("p", { className: "wl-history-empty" }, "还没有保存过报告。生成后点「保存」就会出现在这里。")
       : null
@@ -4832,8 +5164,18 @@ async function bootstrap() {
   void refreshStorageLocation();
   void cleanupReportBaks();
   void loadReportList();
+  // 上次没保存的草稿优先于磁盘内容：用户写到一半关掉宿主，回来还得是那份
+  await loadPersistedDrafts();
+  // 把今天（或上次停在的范围）的扫描结果读回来，否则每次打开都是一片空白
+  void restoreFactsFor(store.snap.range);
   const saved = await loadReportIntoCache(store.snap.range, mode);
-  if (saved) set({ report: saved, reportSaved: saved });
+  // 有未保存草稿就用草稿，别让磁盘内容把它盖掉
+  const draftKey = REPORT_KEY(store.snap.range, mode);
+  if (reportDraftText.has(draftKey) && reportDraftText.get(draftKey) !== saved) {
+    set({ report: reportDraftText.get(draftKey), reportSaved: saved });
+  } else if (saved) {
+    set({ report: saved, reportSaved: saved });
+  }
 }
 
 function sidebarBadge() {
