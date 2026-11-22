@@ -18,7 +18,7 @@ const ROOT = path.join(HERE, "..");
 const MARKER = "/*__SCAN_SOURCE__*/";
 const LIB_START = "/*__LIB_SOURCE__*/";
 const LIB_END = "/*__LIB_SOURCE_END__*/";
-const LIB_ORDER = ["feedback"];
+const LIB_ORDER = ["feedback", "feedback-net"];
 
 function stripExports(source) {
   // 只动行首的 export 关键字，避免误伤字符串里的 "export"。

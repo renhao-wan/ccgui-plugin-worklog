@@ -9,8 +9,9 @@
     "test": "node --test test/",
     "smoke": "node scripts/smoke.mjs",
     "validate": "node scripts/validate-manifest.mjs",
-    "check": "npm run build && npm test && npm run smoke && npm run validate",
-    "scan": "node scripts/scan.mjs"
+    "check": "npm run sync && npm run build && npm test && npm run smoke && npm run validate",
+    "scan": "node scripts/scan.mjs",
+    "sync": "node scripts/check-feedback-sync.mjs"
   },
   "engines": {
     "node": ">=20"
