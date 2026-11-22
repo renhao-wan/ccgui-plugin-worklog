@@ -7,3 +7,7 @@
 # 共用库（ccgui-plugin-shared）已用 eol=lf 规范化，这里必须对齐，
 # 否则产物会混入两种换行符。
 * text=auto eol=lf
+
+# 二进制素材不能被换行符规则碰到。PNG 里含 0x0D 0x0A 字节序列，
+# 若按文本处理，Windows 上重新检出时可能被改写。
+*.png binary
