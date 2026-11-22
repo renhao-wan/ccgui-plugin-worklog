@@ -3497,237 +3497,60 @@ function sessionIndex() {
 }
 
 /** 行内标记：粗体、行内代码、http(s) 链接、会话短 ID。不用 innerHTML，避免把报告内容当 HTML 执行。 */
-function markdownInline(text, keyBase) {
-  const nodes = [];
+/**
+ * 把报告里的 Markdown 渲染成元素。
+ *
+ * 解析与渲染在 src/lib/markdown.mjs + markdown-view.mjs 里，与
+ * github-trending 共用一份——两边的块级语法本来就要一样，各写一份的结果
+ * 是同一段 Markdown 在两个插件里长得不一样。
+ *
+ * 本插件独有的一条：报告里引用的会话短 ID（sessionId 前 8 位）点一下要
+ * 直接打开那个会话。这是通过 extraInline 钩子挂上去的，不碰解析器。
+ */
+function renderReportMarkdown(text) {
+  const h = appCtx.react.createElement;
   const sessions = sessionIndex();
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|\b[0-9a-f]{8}\b)/g;
-  let last = 0;
-  let n = 0;
-  let m;
-  while ((m = re.exec(text))) {
-    if (m.index > last) nodes.push(text.slice(last, m.index));
-    const tok = m[0];
-    const key = keyBase + "i" + n;
-    if (tok.startsWith("**")) {
-      nodes.push(h("strong", { key: key }, tok.slice(2, -2)));
-    } else if (tok.startsWith("`")) {
-      nodes.push(h("code", { key: key, className: "wl-md-code" }, tok.slice(1, -1)));
-    } else if (tok.startsWith("[")) {
-      const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
-      if (link && /^https?:\/\//i.test(link[2])) {
-        nodes.push(
-          h("a", { key: key, href: link[2], target: "_blank", rel: "noreferrer noopener" }, link[1])
-        );
-      } else {
-        nodes.push(tok);
+  return renderMarkdown(h, text, {
+    prefix: "wl",
+    extraInline: (raw, keyBase, hh) => {
+      // 只在含 8 位十六进制短 ID 的文本上动手，绝大多数段落直接走默认路径。
+      if (!/[0-9a-f]{8}/i.test(raw)) return null;
+      const out = [];
+      // 不能用 \b：中文字符（「来源：a1b2c3d4」里的「：」）和 ASCII 字母之间
+      // 不构成单词边界，\b 会漏掉紧贴中文的短 ID。改成显式排除十六进制字符。
+      const re = /(?<![0-9a-f])[0-9a-f]{8}(?![0-9a-f])/gi;
+      let last = 0;
+      let n = 0;
+      let m;
+      while ((m = re.exec(raw))) {
+        if (m.index > last) out.push(raw.slice(last, m.index));
+        const tok = m[0].toLowerCase();
+        const s = sessions.get(tok);
+        if (s) {
+          out.push(
+            hh(
+              "button",
+              {
+                key: keyBase + "s" + n,
+                type: "button",
+                className: "wl-md-session",
+                title: "打开会话 " + shortPath(s.workspace || "") + "（" + tok + "）",
+                onClick: () => void openSession(s),
+              },
+              tok,
+            ),
+          );
+        } else {
+          out.push(m[0]);
+        }
+        last = m.index + m[0].length;
+        n += 1;
       }
-    } else if (sessions.has(tok)) {
-      // 报告里引用的会话短 ID：点一下直接打开那个会话
-      const s = sessions.get(tok);
-      nodes.push(
-        h(
-          "button",
-          {
-            key: key,
-            type: "button",
-            className: "wl-md-session",
-            title: "打开会话 " + shortPath(s.workspace || "") + "（" + tok + "）",
-            onClick: () => void openSession(s),
-          },
-          tok
-        )
-      );
-    } else {
-      nodes.push(tok);
-    }
-    last = m.index + tok.length;
-    n += 1;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
-}
-
-/** 够报告用的 Markdown 子集：标题、表格、列表、引用、代码块、分隔线、段落。 */
-function renderMarkdown(text) {
-  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
-  const out = [];
-  let key = 0;
-  let i = 0;
-  let list = null;
-
-  const flushList = () => {
-    if (!list) return;
-    const items = list.items.map((item, idx) =>
-      h("li", { key: "li" + idx }, markdownInline(item, "l" + key + "_" + idx + "_"))
-    );
-    out.push(h(list.type, { key: "md" + key++, className: "wl-md-list" }, items));
-    list = null;
-  };
-
-  // GFM 表格：表头行 + |---| 分隔行；分隔行的冒号决定列对齐
-  const isTableStart = (idx) =>
-    idx + 1 < lines.length &&
-    lines[idx].indexOf("|") >= 0 &&
-    /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(lines[idx + 1]) &&
-    lines[idx + 1].indexOf("|") >= 0;
-  const splitRow = (raw) => {
-    let s = String(raw || "").trim();
-    if (s.startsWith("|")) s = s.slice(1);
-    if (s.endsWith("|")) s = s.slice(0, -1);
-    return s.split("|").map((cell) => cell.trim());
-  };
-  const cellAlign = (spec) => {
-    const left = spec.startsWith(":");
-    const right = spec.endsWith(":");
-    if (left && right) return "center";
-    if (right) return "right";
-    return "";
-  };
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (/^```/.test(line)) {
-      flushList();
-      const lang = line.slice(3).trim();
-      const buf = [];
-      i += 1;
-      while (i < lines.length && !/^```/.test(lines[i])) {
-        buf.push(lines[i]);
-        i += 1;
-      }
-      if (i < lines.length) i += 1;
-      out.push(
-        h(
-          "pre",
-          { key: "md" + key++, className: "wl-md-pre" },
-          h("code", { className: lang ? "language-" + lang : "" }, buf.join("\n"))
-        )
-      );
-      continue;
-    }
-
-    if (isTableStart(i)) {
-      flushList();
-      const head = splitRow(line);
-      const aligns = splitRow(lines[i + 1]).map(cellAlign);
-      i += 2;
-      const rows = [];
-      while (i < lines.length && lines[i].trim() && lines[i].indexOf("|") >= 0) {
-        rows.push(splitRow(lines[i]));
-        i += 1;
-      }
-      const th = head.map((cell, ci) =>
-        h(
-          "th",
-          { key: "th" + ci, style: aligns[ci] ? { textAlign: aligns[ci] } : undefined },
-          markdownInline(cell, "th" + key + "_" + ci + "_")
-        )
-      );
-      const trs = rows.map((cells, ri) =>
-        h(
-          "tr",
-          { key: "tr" + ri },
-          head.map((_, ci) =>
-            h(
-              "td",
-              { key: "td" + ci, style: aligns[ci] ? { textAlign: aligns[ci] } : undefined },
-              markdownInline(cells[ci] || "", "td" + key + "_" + ri + "_" + ci + "_")
-            )
-          )
-        )
-      );
-      out.push(
-        h(
-          "div",
-          { key: "md" + key++, className: "wl-md-table-wrap" },
-          h(
-            "table",
-            { className: "wl-md-table" },
-            h("thead", null, h("tr", null, th)),
-            h("tbody", null, trs)
-          )
-        )
-      );
-      continue;
-    }
-
-    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
-    if (heading) {
-      flushList();
-      const level = Math.min(6, heading[1].length);
-      out.push(
-        h(
-          "h" + level,
-          { key: "md" + key++, className: "wl-md-h" + level },
-          markdownInline(heading[2], "h" + key + "_")
-        )
-      );
-      i += 1;
-      continue;
-    }
-
-    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
-      flushList();
-      out.push(h("hr", { key: "md" + key++, className: "wl-md-hr" }));
-      i += 1;
-      continue;
-    }
-
-    if (/^>\s?/.test(line)) {
-      flushList();
-      const buf = [];
-      while (i < lines.length && /^>\s?/.test(lines[i])) {
-        buf.push(lines[i].replace(/^>\s?/, ""));
-        i += 1;
-      }
-      out.push(
-        h(
-          "blockquote",
-          { key: "md" + key++, className: "wl-md-quote" },
-          markdownInline(buf.join(" "), "q" + key + "_")
-        )
-      );
-      continue;
-    }
-
-    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
-    const ol = /^\s*\d+[.)]\s+(.*)$/.exec(line);
-    if (ul || ol) {
-      const type = ul ? "ul" : "ol";
-      if (!list || list.type !== type) {
-        flushList();
-        list = { type: type, items: [] };
-      }
-      list.items.push((ul || ol)[1]);
-      i += 1;
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushList();
-      i += 1;
-      continue;
-    }
-
-    flushList();
-    const buf = [line];
-    i += 1;
-    while (
-      i < lines.length &&
-      lines[i].trim() &&
-      !/^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>|```)/.test(lines[i]) &&
-      !isTableStart(i)
-    ) {
-      buf.push(lines[i]);
-      i += 1;
-    }
-    out.push(
-      h("p", { key: "md" + key++, className: "wl-md-p" }, markdownInline(buf.join(" "), "p" + key + "_"))
-    );
-  }
-  flushList();
-  return out;
+      if (!out.length) return null;
+      if (last < raw.length) out.push(raw.slice(last));
+      return out;
+    },
+  });
 }
 
 function ReportPanel() {
@@ -3993,7 +3816,7 @@ function ReportPanel() {
           )
         : hasReport
           ? viewMode === "preview"
-            ? h("div", { className: "wl-md" }, renderMarkdown(draft))
+            ? h("div", { className: "wl-md" }, renderReportMarkdown(draft))
             : h("textarea", {
                 className: "wl-textarea",
                 value: draft,
@@ -4558,7 +4381,7 @@ function ReportViewer() {
     : v.error
       ? h("p", { className: "wl-viewer-note is-error" }, "读取失败：" + v.error)
       : v.text.trim()
-        ? h("div", { className: "wl-md wl-viewer-md" }, renderMarkdown(v.text))
+        ? h("div", { className: "wl-md wl-viewer-md" }, renderReportMarkdown(v.text))
         : h("p", { className: "wl-viewer-note" }, "这份报告是空的。");
 
   return h(
