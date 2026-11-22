@@ -1,7 +1,7 @@
 {
   "id": "worklog",
   "name": "工作志",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sdkVersion": "^0.3.25",
   "minAppVersion": "1.2.4",
   "author": "renhao-wan",
@@ -25,6 +25,6 @@
     "host:session",
     "exec:node",
     "exec:git",
-    "network:none"
+    "network:ccgui-feedback.2653990378.workers.dev"
   ]
 }

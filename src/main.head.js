@@ -10,8 +10,13 @@
 
 const PLUGIN_ID = "worklog";
 const TAB_KEY = "worklog";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 const SETTINGS_KEY = "worklog.settings.v1";
+// 反馈中转。改主机名要同步 manifest.json 的 network:<host>（精确匹配，不支持通配）。
+const FEEDBACK_ENDPOINT = "https://ccgui-feedback.2653990378.workers.dev";
+const FEEDBACK_REPO = "renhao-wan/ccgui-plugin-worklog";
+const FEEDBACK_PLUGIN_NAME = "工作志";
+const FEEDBACK_TIMEOUT_MS = 15000;
 // 用户最后停在哪个口吻。宿主重新激活插件（切页签、热重载）时靠它恢复，
 // 不能让「刚选好的自定义口吻」在回来时退回到默认口吻。
 const VIEW_KEY = "worklog.view.v1";
@@ -112,6 +117,9 @@ function sortEngines(list) {
 }
 
 /*__SCAN_SOURCE__*/
+
+/*__LIB_SOURCE__*/
+/*__LIB_SOURCE_END__*/
 
 const CSS = `
 /* 设计方向：achromatic-ledger（浅色账本风格）。
@@ -581,6 +589,28 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-save-state.is-bad { color:var(--wl-neg-ink); }
 .wl-save-bar .wl-muted { font-size:12px; color:var(--wl-muted); }
 
+/* ---------- 反馈 ---------- */
+.wl-feedback-text { width:100%; min-height:96px; resize:vertical; font-family:inherit; font-size:13px; line-height:1.6; box-sizing:border-box; padding:8px 12px; border:1px solid var(--wl-control); border-radius:var(--wl-r-ctl); background:var(--wl-ground); color:var(--wl-text); }
+.wl-feedback-text:focus { outline:2px solid var(--wl-accent); outline-offset:-1px; }
+.wl-feedback-row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-top:6px; }
+.wl-feedback-count { font-variant-numeric:tabular-nums; }
+.wl-feedback-quota { text-align:right; }
+/* 额度区的「重试」：长得像链接但仍是按钮，键盘可达 */
+.wl-link-btn { margin-left:6px; padding:0; border:0; background:none; font:inherit; font-size:12px; color:var(--wl-accent); text-decoration:underline; cursor:pointer; }
+.wl-link-btn:disabled { opacity:.5; cursor:not-allowed; }
+.wl-link-btn:focus-visible { outline:2px solid var(--wl-accent); outline-offset:2px; }
+.wl-feedback-actions { display:flex; align-items:center; gap:8px; margin-top:10px; }
+/* <a> 当按钮用时没有 <button> 的默认盒模型，补上同样的外观 */
+.wl-feedback-issue { display:inline-flex; align-items:center; height:34px; box-sizing:border-box; padding:0 14px; border:1px solid var(--wl-control); border-radius:var(--wl-r-ctl); background:var(--wl-surface); color:var(--wl-text); font-size:13px; line-height:1; text-decoration:none; }
+.wl-feedback-issue:hover { background:var(--wl-raised); }
+.wl-feedback-status { margin:10px 0 0; font-size:13px; }
+.wl-feedback-status.is-ok { color:var(--wl-positive); font-weight:500; }
+.wl-feedback-status.is-bad { color:var(--wl-neg-ink); }
+/* 成功回执：按钮从「主操作」变成「已完成」。保留绿边而不是整块变绿，
+ * 免得和「发送中」的忙碌态混淆；文字本身已改成「已发送」。
+ * opacity:1 是必须的——:disabled 的 .5 会把它又糊成灰色。 */
+.wl-btn.primary.wl-feedback-sent { border-color:var(--wl-positive); background:transparent; color:var(--wl-positive); opacity:1; cursor:default; }
+
 /* ---------- 日期范围 ---------- */
 .wl-range { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .wl-range-inputs { display:inline-flex; align-items:center; gap:6px; }
@@ -924,6 +954,94 @@ function safeError(e) {
 
 function pad2(n) {
   return String(n).padStart(2, "0");
+}
+
+/** 给桥接调用加一层超时。宿主侧若一直挂着，界面不能永远停在「发送中…」。 */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + " timeout")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+/** 宿主版本。老版本宿主可能没有这一项，取不到就留空，不能因此发不出反馈。 */
+function hostAppVersion(ctx) {
+  try {
+    return ctx && ctx.host && typeof ctx.host.appVersion === "string" ? ctx.host.appVersion : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 发一条反馈到中转。返回 describeFeedbackResult 的归一化结果。
+ *
+ * 不复用扫描用的 HTTP 逻辑：反馈是 POST，连接层重试会把同一条内容发两遍——
+ * 用户看到「发送失败」再点一次，比静默重复更可控。
+ */
+async function sendFeedback(ctx, text) {
+  const payload = buildFeedbackPayload({
+    text,
+    pluginId: PLUGIN_ID,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "POST",
+        url: FEEDBACK_ENDPOINT + "/feedback",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "ccgui-worklog/" + ctx.version,
+        },
+        body: JSON.stringify(payload),
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "feedback"
+    );
+    return describeFeedbackResult({ status: Number(res && res.status) || 0, body: res && res.body });
+  } catch (error) {
+    return describeFeedbackResult({ error });
+  }
+}
+
+/**
+ * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住发反馈，
+ * 但要让界面知道「是连不上」而不是「额度紧张」，两句话说给用户听的意思完全不同。
+ */
+async function fetchQuota(ctx) {
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "GET",
+        url: FEEDBACK_ENDPOINT + "/quota",
+        headers: { "User-Agent": "ccgui-worklog/" + ctx.version },
+        body: null,
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "quota"
+    );
+    const status = Number(res && res.status) || 0;
+    if (!(status >= 200 && status < 300)) return { offline: true };
+    const body = res && typeof res.body === "string" ? res.body : "";
+    const data = body ? JSON.parse(body) : null;
+    // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/"" 读成 0，
+    // 界面会说「今天的额度已用完」。
+    const remaining = data ? quotaCount(data.remaining) : null;
+    return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
+  } catch {
+    return { offline: true };
+  }
 }
 
 function todayStr() {
@@ -4813,6 +4931,195 @@ async function revokeUnusedGrants() {
   for (const path of [...grantIds.keys()]) await revokeUnusedGrant(path);
 }
 
+function FeedbackSection() {
+  const R = appCtx.react;
+  const ctx = appCtx;
+
+  const textState = R.useState("");
+  const text = textState[0];
+  const setText = textState[1];
+  // "" -> "sending" -> "sent"/"error"
+  const sendState = R.useState("");
+  const sendStatus = sendState[0];
+  const setSendStatus = sendState[1];
+  const resultState = R.useState(null);
+  const result = resultState[0];
+  const setResult = resultState[1];
+  const quotaState = R.useState(null);
+  const quota = quotaState[0];
+  const setQuota = quotaState[1];
+  const quotaTried = R.useRef(false);
+  // 同步的在途标志。canSend 是渲染时的闭包值，同一 tick 内两次触发都会
+  // 读到旧的 sendStatus=""，只在状态里防不住双击。
+  const sendingRef = R.useRef(false);
+
+  // 只在第一次打开设置页时查额度。查不到就保持 {offline:true}，UI 说明是
+  // 「连不上」而不是「额度紧张」——两句话对用户的意思完全不同。
+  async function loadQuota() {
+    const q = await fetchQuota(ctx);
+    setQuota(q);
+    return q;
+  }
+
+  R.useEffect(() => {
+    if (quotaTried.current) return;
+    quotaTried.current = true;
+    void loadQuota();
+    // 只在挂载时查一次；之后由「重试」按钮或发送结果更新。
+  }, []);
+
+  const trimmed = normaliseFeedbackText(text);
+  const canSend = trimmed.length > 0 && sendStatus !== "sending";
+
+  const issueUrl = buildIssueUrl({
+    repo: FEEDBACK_REPO,
+    pluginName: FEEDBACK_PLUGIN_NAME,
+    text: trimmed,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+
+  async function submit() {
+    // sendingRef 是同步的：同一 tick 内两次触发都会读到 true，挡住双击。
+    // sendStatus 要等重渲染才更新，靠它挡不住。
+    if (!canSend || sendingRef.current) return;
+    sendingRef.current = true;
+    const submitted = trimmed;
+    setSendStatus("sending");
+    setResult(null);
+
+    let r;
+    try {
+      r = await sendFeedback(ctx, submitted);
+    } finally {
+      sendingRef.current = false;
+    }
+
+    setSendStatus(r.ok ? "sent" : "error");
+    setResult(r);
+    if (!r.ok) return;
+
+    // 只清掉「这次发出去的那段」。发送期间用户可能又敲了内容（那几个请求往返
+    // 里 textarea 没禁用），直接清空会把他新写的也抹掉。
+    setText((cur) => (cur === submitted ? "" : cur));
+
+    // 额度优先用服务端回传的真实值。查额度时失败了也不要紧——成功响应里
+    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。没有回传就自减一格。
+    setQuota((prev) => nextQuota(prev, r.remaining));
+  }
+
+  const quotaText = describeQuota(quota);
+  const statusText =
+    sendStatus === "sending" ? "发送中…" : result ? result.message : "";
+
+  // 成功时正文被清空，按钮会变成不可点的死按钮。若文案还停在「发送反馈」，
+  // 用户看到的就是「点了没反应」——回执必须落在按钮自己身上。
+  const sendLabel =
+    sendStatus === "sending" ? "发送中…" : sendStatus === "sent" ? "已发送" : "发送反馈";
+
+  return h(
+    "section",
+    { className: "wl-section" },
+    h(
+      "div",
+      { className: "wl-section-label" },
+      h("h2", null, "反馈"),
+      h("p", null, "遇到问题或想提建议，两种方式任选其一。")
+    ),
+    h(
+      "div",
+      { className: "wl-section-panel" },
+      h("textarea", {
+        className: "wl-input wl-feedback-text",
+        value: text,
+        rows: 5,
+        maxLength: TEXT_LIMIT,
+        placeholder: "描述问题或建议…（最多 " + TEXT_LIMIT + " 字）",
+        spellCheck: false,
+        "aria-label": "反馈正文",
+        onChange: (e) => {
+          setText(e.target.value);
+          // 重新输入等于开了一条新反馈：上一条的回执（成功或失败）都该撤掉，
+          // 否则按钮已经回到「发送反馈」，下面却还写着「反馈已发送」。
+          if (sendStatus !== "sending") {
+            setSendStatus("");
+            setResult(null);
+          }
+        },
+      }),
+      h(
+        "div",
+        { className: "wl-feedback-row" },
+        h("span", { className: "wl-hint wl-feedback-count" }, text.length + " / " + TEXT_LIMIT),
+        h(
+          "span",
+          { className: "wl-hint wl-feedback-quota" },
+          quotaText.message,
+          // 额度查不到 / 用完了都给一条重试路径，否则用户只能重开设置页。
+          quotaText.canRetry
+            ? h(
+                "button",
+                {
+                  type: "button",
+                  className: "wl-link-btn wl-feedback-quota-retry",
+                  disabled: sendStatus === "sending",
+                  onClick: () => void loadQuota(),
+                },
+                "重试"
+              )
+            : null
+        )
+      ),
+      h(
+        "div",
+        { className: "wl-feedback-actions" },
+        h(
+          "a",
+          {
+            className: "wl-feedback-issue",
+            href: issueUrl,
+            target: "_blank",
+            rel: "noreferrer noopener",
+            title: "在浏览器里打开预填好的 Issue 页面",
+          },
+          "通过 GitHub 提 Issue"
+        ),
+        h(
+          "button",
+          {
+            type: "button",
+            className:
+              "wl-btn primary wl-feedback-send" +
+              (sendStatus === "sent" ? " wl-feedback-sent" : ""),
+            disabled: !canSend,
+            onClick: () => void submit(),
+          },
+          sendLabel
+        )
+      ),
+      statusText
+        ? h(
+            "p",
+            {
+              className:
+                "wl-note-line wl-feedback-status" +
+                (sendStatus === "sent" ? " is-ok" : "") +
+                (sendStatus === "error" ? " is-bad" : ""),
+              role: "status",
+              "aria-live": "polite",
+            },
+            statusText
+          )
+        : null,
+      h(
+        "p",
+        { className: "wl-hint" },
+        "发送的内容只有这段文字、插件版本与 CC GUI 版本。不含会话、代码或本机路径。"
+      )
+    )
+  );
+}
+
 function SettingsSection() {
   const R = appCtx.react;
   const snap = useSnap();  const formState = R.useState(null);
@@ -5444,6 +5751,7 @@ function SettingsSection() {
         )
       )
     ),
+    h(FeedbackSection, null),
     h(
       "div",
       { className: "wl-save-bar" },

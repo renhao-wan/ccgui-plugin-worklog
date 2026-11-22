@@ -10,8 +10,13 @@
 
 const PLUGIN_ID = "worklog";
 const TAB_KEY = "worklog";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 const SETTINGS_KEY = "worklog.settings.v1";
+// 反馈中转。改主机名要同步 manifest.json 的 network:<host>（精确匹配，不支持通配）。
+const FEEDBACK_ENDPOINT = "https://ccgui-feedback.2653990378.workers.dev";
+const FEEDBACK_REPO = "renhao-wan/ccgui-plugin-worklog";
+const FEEDBACK_PLUGIN_NAME = "工作志";
+const FEEDBACK_TIMEOUT_MS = 15000;
 // 用户最后停在哪个口吻。宿主重新激活插件（切页签、热重载）时靠它恢复，
 // 不能让「刚选好的自定义口吻」在回来时退回到默认口吻。
 const VIEW_KEY = "worklog.view.v1";
@@ -112,6 +117,289 @@ function sortEngines(list) {
 }
 
 const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\nconst MAX_TOOL_ERRORS_PER_SESSION = 50;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n// 用户连续发言、助手还没回应时先排队的上限\nconst MAX_PENDING_TURNS = 5;\n// 资源上限：会话日志可能被巨型附件撑到几百 MB。超限的文件与单行直接跳过，\n// 并在 failures 里说明，免得整次扫描被一个坏文件拖垮。\nconst MAX_SESSION_FILE_MB = 512;\nconst MAX_FILES_PER_SCAN = 4000;\nconst MAX_LINE_CHARS = 32 * 1024 * 1024;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。\n *  只列已知标签，不用裸 \"<\" 兜底——用户会粘贴 HTML/XML/JSX，\n *  那种消息是真实需求，不能吞掉。 */\nconst INTERNAL_PREFIXES = [\n  \"<task-notification\",\n  \"<fork-boilerplate\",\n  \"<command-message\",\n  \"<command-name>\",\n  \"<command-args>\",\n  \"<local-command-stdout>\",\n  \"<local-command-stderr>\",\n  \"<local-command-caveat>\",\n  \"<system-reminder>\",\n  \"<user-prompt-submit-hook>\",\n  \"<bash-input>\",\n  \"<bash-stdout>\",\n  \"<bash-stderr>\",\n  \"<ide_opened_file>\",\n  \"<ide_selection>\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\n/**\n * 插件自己生成报告时留下的会话。\n *\n * 宿主执行 agent 会把这一轮也写进会话日志，cwd 正是「引擎运行目录」。\n * 不排除的话，写日报这件事本身会变成一条「工作产出」：\n * 生成日报 → 会话里多一条「写日报」→ 下次报告把它写进去 → 越滚越多。\n * 只认我们自己写死的提示词开头，用户真的要求「写日报」不会被误伤。\n */\nconst GENERATION_PROMPT_PREFIXES = [\n  \"你是一位替工程师写工作日报的助手。\",\n  \"你是一位帮工程师做当日复盘的教练。\",\n  \"你是一位替工程师写周报的助手。\",\n  \"你是一位替工程师写工作记录的助手。\",\n];\n\n/** 这一整行是否是「插件自己在跑生成」的那一刻。 */\nfunction isGenerationPrompt(text) {\n  const t = String(text || \"\").trim();\n  if (!t) return false;\n  return GENERATION_PROMPT_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    if (out.length >= MAX_FILES_PER_SCAN) return out;\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。\n      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */\nfunction messageContent(msg) {\n  if (!msg) return null;\n  const c = msg.content;\n  if (typeof c === \"string\") return c.trim() ? [{ type: \"text\", text: c }] : [];\n  if (Array.isArray(c)) return c;\n  return null;\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\n/* ------------------------------------------------------------ 引擎适配器\n * 扫描器只认识一种会话日志格式：Claude Code 的 JSONL。其它引擎（Codex、\n * Qoder、Kimi…）的字段名与目录布局都不同，没有真实样本前不臆造解析。\n * 这里把「读一行原始对象 → 规范字段」集中成适配器，后续接入新引擎时\n * 只需要新增一个条目，扫描主流程不用改。\n */\nconst ADAPTERS = {\n  claude: {\n    id: \"claude\",\n    label: \"Claude Code\",\n    /** 规范形状：{ ts, sessionId, workspace, branch, cliVersion, sidechain, kind, content } */\n    readLine(o) {\n      if (!o || typeof o !== \"object\") return null;\n      const kind = o.type === \"user\" || o.type === \"assistant\" ? o.type : \"\";\n      return {\n        ts: typeof o.timestamp === \"string\" ? o.timestamp : null,\n        sessionId: o.sessionId ? String(o.sessionId) : null,\n        workspace: o.cwd ? String(o.cwd) : \"\",\n        branch: o.gitBranch ? String(o.gitBranch) : null,\n        cliVersion: o.version ? String(o.version) : null,\n        sidechain: o.isSidechain === true,\n        kind: kind,\n        content: messageContent(o.message),\n      };\n    },\n  },\n};\n\nfunction resolveAdapter(name) {\n  const key = String(name || \"\").trim().toLowerCase();\n  if (!key || key === \"auto\") return ADAPTERS.claude;\n  // 只认 ADAPTERS 的自有属性：constructor / __proto__ 之类会命中原型链，\n  // 拿到一个没有 readLine 的对象，最后变成「扫描成功但 0 个会话」。\n  return Object.prototype.hasOwnProperty.call(ADAPTERS, key) ? ADAPTERS[key] : null;\n}\n\n/** 按行读文件，单行超长时跳过但继续。\n *\n *  readline 遇到超长行会把整行缓存在内存里：一条几 GB 的附件行足以把扫描\n *  进程撑爆。这里自己切分，跳过期间也不保留数据，内存只与 chunk 大小有关。 */\nasync function* readLinesBounded(filePath, maxLine) {\n  const stream = fs.createReadStream(filePath, { encoding: \"utf8\", highWaterMark: 1 << 16 });\n  let buf = \"\";\n  let skipping = false;\n  for await (const chunk of stream) {\n    if (skipping) {\n      const nl = chunk.indexOf(\"\\n\");\n      if (nl < 0) continue; // 这一块仍然属于被丢弃的那行\n      skipping = false;\n      buf = chunk.slice(nl + 1);\n    } else {\n      buf += chunk;\n    }\n    let idx;\n    while ((idx = buf.indexOf(\"\\n\")) >= 0) {\n      const line = buf.slice(0, idx);\n      buf = buf.slice(idx + 1);\n      if (line.length <= maxLine) yield line;\n    }\n    if (buf.length > maxLine) {\n      // 还没有换行就已经超长：丢弃这一行剩余部分\n      buf = \"\";\n      skipping = true;\n    }\n  }\n  if (!skipping && buf && buf.length <= maxLine) yield buf;\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd, adapter) {\n  if (file.size > MAX_SESSION_FILE_MB * 1048576) {\n    throw new Error(\"会话文件 \" + path.basename(file.p) + \" 超过 \" + MAX_SESSION_FILE_MB + \"MB，已跳过\");\n  }\n\n  const s = {\n    sessionId: null,\n    engine: adapter.id,\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    // 工具名来自 JSONL，是外部输入：普通对象上 \"constructor\"/\"__proto__\"\n    // 会命中原型链或被静默忽略，计数变字符串或直接丢失。\n    tools: Object.create(null),\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: Object.create(null),\n    commands: [],\n    hours: Object.create(null),\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 这个文件是不是插件自己生成报告留下的：只有「整份会话的第一条真实用户消息\n  // 就是我们的提示词」才算。用户只是把提示词粘进真实会话里讨论时，那一行按\n  // 内部注入跳过，不能把整份会话一起丢掉。\n  let isSelfGenerated = false;\n  let sawAnyRealUserMessage = false;\n  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对\n  let pendingTurns = [];\n  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失\n  let carryTurn = null;\n\n  for await (const line of readLinesBounded(file.p, MAX_LINE_CHARS)) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    const rec = adapter.readLine(o);\n    if (!rec) continue;\n    if (rec.sessionId && !s.sessionId) s.sessionId = rec.sessionId;\n    if (rec.workspace && !s.workspace) s.workspace = rec.workspace;\n    if (rec.branch && !s.gitBranch) s.gitBranch = rec.branch;\n    if (rec.cliVersion && !s.cliVersion) s.cliVersion = rec.cliVersion;\n\n    const tsRaw = rec.ts;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) {\n      sawAnyMessageBeforeWindow = true;\n      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对\n      if (rec.kind === \"user\" && !rec.sidechain) {\n        const early = rec.content;\n        if (early && !isToolResult(early)) {\n          const text = textBlocks(early).join(\"\\n\").trim();\n          if (text && !isInternalText(text)) {\n            // 窗口之前就有过真实用户消息：这份文件不是插件自己生成报告留下的\n            if (!isGenerationPrompt(text)) sawAnyRealUserMessage = true;\n            carryTurn = {\n              ts: tsRaw,\n              user: clip(text, MAX_TURN_USER_TEXT),\n              fromEarlierDay: true,\n            };\n          }\n        }\n      }\n      continue;\n    }\n    if (ts >= windowEnd) continue;\n\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    const content = rec.content;\n    if (content === null) continue;\n\n    if (rec.sidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (rec.kind === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n          // 报错只保留最近的，避免单个会话几百条错误撑大快照\n          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      // 这一行是插件自己在生成报告：只有「整份会话的第一条真实用户消息就是\n      // 我们的提示词」才认定整份丢弃。用户把提示词粘进自己的会话里讨论时，\n      // 那只是其中一条消息，跳过它就好，不能把当天的真实工作一起吞掉。\n      if (isGenerationPrompt(joined)) {\n        if (!sawAnyRealUserMessage) {\n          isSelfGenerated = true;\n          break;\n        }\n        continue;\n      }\n      sawAnyRealUserMessage = true;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      // 保留最近的 N 条：报告关心的是会话最后在做什么\n      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();\n      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });\n      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();\n      // 用户已经继续对话，之前窗口外的要求不再等待配对\n      carryTurn = null;\n      continue;\n    }\n\n    if (rec.kind === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            // 同样保留最近的命令\n            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上。\n      // 用户连续发了几条就合并成一个要求，不要只留最后一条。\n      if (replyText) {\n        let turn = null;\n        if (pendingTurns.length) {\n          turn = {\n            ts: pendingTurns[pendingTurns.length - 1].ts,\n            user: clip(pendingTurns.map((t) => t.user).join(\" / \"), MAX_TURN_USER_TEXT),\n            fromEarlierDay: false,\n          };\n          pendingTurns = [];\n        } else if (carryTurn) {\n          // 跨天：前一天的用户要求，当天才得到第一次回应\n          turn = carryTurn;\n          carryTurn = null;\n        }\n        if (turn) {\n          s.turns.push({\n            ts: turn.ts,\n            user: turn.user,\n            reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n            fromEarlierDay: turn.fromEarlierDay === true,\n          });\n          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        }\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (isSelfGenerated) return null;\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: Object.create(null), userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // 目前只实现 Claude Code 的适配器；显式指定未知引擎时明确失败，\n  // 而不是悄悄按 Claude 的格式解析出一堆空会话。\n  const adapter = resolveAdapter(args.engine);\n  if (!adapter) {\n    throw new Error(\n      \"不支持引擎 \" + args.engine + \"；目前只能解析 Claude Code 的会话日志（--engine claude）\"\n    );\n  }\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」\n  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）\n  if (args.root && args.root !== \"auto\" && !fs.existsSync(root)) {\n    throw new Error(\"会话根目录不存在：\" + root);\n  }\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd, adapter);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    engine: adapter.id,\n    engineLabel: adapter.label,\n    supportedEngines: Object.keys(ADAPTERS),\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
+
+// ---- 以下由 src/lib/*.mjs 内联生成 ----
+// ---- src/lib/feedback.mjs ----
+/**
+ * 反馈渠道的纯函数层：正文归一化、Issue 链接拼装、请求体收敛、响应文案。
+ *
+ * 全部离线可测。网络与 UI 在 main.head.js 里，这一层只回答「发什么」和
+ * 「回什么」，方便把隐私边界钉死在测试里：请求体只允许五个字段。
+ */
+
+/** 正文上限。再长就不是一条反馈，而是一篇文档了。 */
+const TEXT_LIMIT = 1000;
+
+/**
+ * 收敛用户输入：去控制字符、统一换行、折叠连续空行与行尾空白、限长。
+ * 保留大小写、中文、emoji 与**换行**——用户最常贴的就是报错日志，
+ * 压成一行后堆栈就没法看了。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function normaliseFeedbackText(raw) {
+  return String(raw === undefined || raw === null ? "" : raw)
+    // 先统一换行，再剥控制字符（保留 \n）。制表符换成空格——堆栈缩进有用。
+    .replace(/\r\n?/g, "\n")
+    .replace(/\t/g, " ")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f�]/g, "")
+    // 只去行尾空白与整段的首尾空白。**正文内行首缩进要留着**：
+    // 报错堆栈靠它对齐，去掉后 `at fetchTrending` 就和日志正文混在一起了。
+    .replace(/[ \t]+$/gm, "")
+    .replace(/^[ \t]+/, "")
+    // 三个以上连续换行压成两个（一段空行），既保留分段又不留大片空白。
+    .replace(/\n{3,}/g, "\n\n")
+    // 首尾空行去掉。
+    .replace(/^\n+|\n+$/g, "")
+    .slice(0, TEXT_LIMIT)
+    .replace(/[ \t\n]+$/, "");
+}
+
+/**
+ * GitHub 新建 Issue 的预填链接。
+ *
+ * 用预填而不是直接调 API：API 要 PAT，PAT 写进插件源码等于公开。预填链接
+ * 只依赖用户浏览器里已有的登录态，插件一行网络代码都不用写。
+ *
+ * @param {{repo: string, pluginName: string, text: string, pluginVersion: string, hostVersion: string}} o
+ * @returns {string}
+ */
+function buildIssueUrl(o) {
+  const text = normaliseFeedbackText(o.text);
+  const body = [
+    text || "_（请在这里描述问题或建议）_",
+    "",
+    "---",
+    "插件：" + String(o.pluginName || "") + " " + String(o.pluginVersion || ""),
+    "CC GUI：" + String(o.hostVersion || ""),
+  ].join("\n");
+  const q = new URLSearchParams({
+    title: "[反馈] " + String(o.pluginName || ""),
+    body,
+  });
+  return "https://github.com/" + String(o.repo || "") + "/issues/new?" + q.toString();
+}
+
+/** 请求体允许的字段。白名单而非黑名单：漏传字段比误传路径好。 */
+const PAYLOAD_FIELDS = ["text", "pluginId", "pluginVersion", "hostVersion", "ts"];
+
+/**
+ * 组装发往中转的请求体，只保留白名单字段。
+ *
+ * @param {object} o
+ * @returns {{text: string, pluginId: string, pluginVersion: string, hostVersion: string, ts: number}}
+ */
+function buildFeedbackPayload(o) {
+  const src = {
+    text: normaliseFeedbackText(o.text),
+    pluginId: String(o.pluginId || ""),
+    pluginVersion: String(o.pluginVersion || ""),
+    hostVersion: String(o.hostVersion || ""),
+    ts: Number(o.now) || Date.now(),
+  };
+  const out = {};
+  for (const k of PAYLOAD_FIELDS) out[k] = src[k];
+  return out;
+}
+
+function parseJson(body) {
+  if (typeof body !== "string" || !body) return null;
+  try {
+    const v = JSON.parse(body);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把服务端给的额度字段收敛成 `number | null`。
+ *
+ * **别用 `Number.isFinite(Number(v))`**：`Number(null)` 与 `Number("")` 都是 0，
+ * 于是「中转没带这个字段」会被读成「今天 0 条额度」，界面就对刚发送成功的
+ * 用户说「今天的额度已用完」。这里只认真正的数字与非空数字字符串。
+ *
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function quotaCount(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string") {
+    if (!v.trim()) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * 发送成功后更新界面上的剩余额度。
+ *
+ * 服务端回传的额度优先（顺手纠正「暂时连不上」）；没给就按本地旧值自减
+ * 一条，旧值也没有就原样保留。纯函数，单测钉住「别把 null 读成 0」。
+ *
+ * @param {{remaining?: number, dailyLimit?: number, offline?: boolean}|null} prev
+ * @param {unknown} fromServer 服务端回传的 remaining
+ * @returns {object|null}
+ */
+function nextQuota(prev, fromServer) {
+  const n = quotaCount(fromServer);
+  if (n !== null) {
+    return { remaining: n, dailyLimit: (prev && prev.dailyLimit) || 30 };
+  }
+  const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
+  if (prevRemaining === null) return prev;
+  return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+}
+
+/**
+ * 把一次中转响应翻译成界面文案。
+ *
+ * 一条原则：**永远给出「你还能做什么」**。反馈发不出去不是用户的错，
+ * 所以每条失败文案都要么说清原因，要么指向还能走的路（GitHub Issue）。
+ * 泛泛一句「发送失败」等于让用户卡死在这里。
+ *
+ * @param {{status?: number, body?: string, error?: Error}} r
+ * @returns {{ok: boolean, kind: string, message: string, remaining: number|null}}
+ */
+function describeFeedbackResult(r) {
+  if (r && r.error) {
+    const raw = String(r.error.message || r.error);
+    if (/timed?\s*out|timeout|ETIMEDOUT/i.test(raw)) {
+      return {
+        ok: false,
+        kind: "timeout",
+        message: "发送超时。中转可能被网络挡住，可改用 GitHub Issue 反馈",
+        remaining: null,
+      };
+    }
+    if (/network:|permission|授权/i.test(raw)) {
+      return { ok: false, kind: "denied", message: "网络权限未生效，请重新安装插件", remaining: null };
+    }
+    // DNS 污染、代理没开、防火墙——国内最常见的三种，用户能分不清，
+    // 但「检查网络或代理」这句对他们是有用的动作。
+    return {
+      ok: false,
+      kind: "network",
+      message: "连不上反馈服务，请检查网络或代理，也可改用 GitHub Issue 反馈",
+      remaining: null,
+    };
+  }
+
+  const status = Number(r && r.status) || 0;
+  const data = parseJson(r && r.body);
+  const remaining = data ? quotaCount(data.remaining) : null;
+  const code = data && typeof data.error === "string" ? data.error : "";
+
+  if (status >= 200 && status < 300) {
+    // 成功响应必须带 ok:true。只看状态码会把运营商劫持页、登录门户、
+    // 代理错误页（都会返回 200）当成「已发送」——用户以为发出去了，
+    // 实际什么都没有。
+    if (!data || data.ok !== true) {
+      return {
+        ok: false,
+        kind: "garbled",
+        message: "反馈服务返回了无法识别的内容，可能被网络拦截，可改用 GitHub Issue 反馈",
+        remaining: null,
+      };
+    }
+    return { ok: true, kind: "sent", message: "反馈已发送，谢谢", remaining };
+  }
+
+  if (status === 429) {
+    // kind 是 Worker 给的：burst = 10 分钟窗口撞了，daily = 今天真没了。
+    // 分不清就按 daily 说——让人等十分钟比让人白等一天更糟。
+    const burst = data && data.kind === "burst";
+    return {
+      ok: false,
+      kind: "rate_limited",
+      message: burst
+        ? "发得太快了，稍等几分钟再试，或改用 GitHub Issue 反馈"
+        : "今天的反馈额度已用完，明天再来，或改用 GitHub Issue 反馈",
+      // burst 时今天还有额度，写死 0 会让界面谎报「今天用完了」。
+      remaining: burst ? remaining : 0,
+    };
+  }
+
+  if (status === 413) {
+    return { ok: false, kind: "invalid", message: "反馈内容太长了，请缩短后重试", remaining };
+  }
+
+  if (status === 400) {
+    // 400 的几种原因要分开说：empty_text 是用户没写，unknown_plugin 是
+    // 版本错位，叫用户去「缩短内容」是把他引到错的方向。
+    if (code === "unknown_plugin") {
+      return {
+        ok: false,
+        kind: "invalid",
+        message: "中转不认识这个插件版本，请更新插件，或改用 GitHub Issue 反馈",
+        remaining,
+      };
+    }
+    if (code === "empty_text") {
+      return { ok: false, kind: "invalid", message: "反馈内容是空的，写点内容再发", remaining };
+    }
+    return { ok: false, kind: "invalid", message: "反馈内容不合要求，请缩短后重试", remaining };
+  }
+
+  if (status === 502 || status === 503 || status === 500) {
+    return {
+      ok: false,
+      kind: "http",
+      // 502 = 发不出邮件、503 = KV 不可用、500 = 中转内部错误。
+      // 三种都是中转那边的事，用户唯一能做的是稍后再试或换 Issue。
+      message: "中转暂时不可用，稍后再试，或改用 GitHub Issue 反馈",
+      remaining,
+    };
+  }
+
+  if (status === 0) {
+    // 请求根本没拿到响应：和网络错误一样处理，别把 "HTTP 0" 甩给用户。
+    return {
+      ok: false,
+      kind: "network",
+      message: "连不上反馈服务，请检查网络或代理，也可改用 GitHub Issue 反馈",
+      remaining: null,
+    };
+  }
+
+  return {
+    ok: false,
+    kind: "http",
+    message: "发送失败（HTTP " + status + "），可改用 GitHub Issue 反馈",
+    remaining,
+  };
+}
+
+/**
+ * 额度提示文案。查不到额度时也要给一句话，不能空着。
+ *
+ * 两种「查不到」要分开：
+ *   - `{offline: true}`：请求失败（网络/代理/中转挂了）。说「额度有限」
+ *     会把网络故障说成用户在刷屏，把他引到错误的方向。
+ *   - 其他：服务端回了但字段脏，或压根没查。这时该提醒别刷屏。
+ *
+ * @param {{remaining?: number, dailyLimit?: number, offline?: boolean}|null} quota
+ * @returns {{remaining: number|null, message: string}}
+ */
+function describeQuota(quota) {
+  if (quota && quota.offline) {
+    return { remaining: null, message: "暂时连不上反馈服务，发送时再试", canRetry: true };
+  }
+  // Number(null) === 0、Number("") === 0：不显式挡掉，脏数据会被读成「0 条」，
+  // 界面就说「今天的额度已用完」。先用「是不是数字」把它挡在这一层。
+  const raw = quota ? quota.remaining : undefined;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    return { remaining: null, message: "额度有限，请勿刷屏", canRetry: true };
+  }
+  const remaining = Math.max(0, raw);
+  if (remaining === 0) {
+    return { remaining: 0, message: "今天的反馈额度已用完，明天再来", canRetry: true };
+  }
+  return { remaining, message: "今天还可发 " + remaining + " 条反馈", canRetry: false };
+}
+
 
 const CSS = `
 /* 设计方向：achromatic-ledger（浅色账本风格）。
@@ -581,6 +869,28 @@ html.dark .wl-toast, .dark .wl-toast { box-shadow:0 8px 24px rgba(0,0,0,.5); }
 .wl-save-state.is-bad { color:var(--wl-neg-ink); }
 .wl-save-bar .wl-muted { font-size:12px; color:var(--wl-muted); }
 
+/* ---------- 反馈 ---------- */
+.wl-feedback-text { width:100%; min-height:96px; resize:vertical; font-family:inherit; font-size:13px; line-height:1.6; box-sizing:border-box; padding:8px 12px; border:1px solid var(--wl-control); border-radius:var(--wl-r-ctl); background:var(--wl-ground); color:var(--wl-text); }
+.wl-feedback-text:focus { outline:2px solid var(--wl-accent); outline-offset:-1px; }
+.wl-feedback-row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-top:6px; }
+.wl-feedback-count { font-variant-numeric:tabular-nums; }
+.wl-feedback-quota { text-align:right; }
+/* 额度区的「重试」：长得像链接但仍是按钮，键盘可达 */
+.wl-link-btn { margin-left:6px; padding:0; border:0; background:none; font:inherit; font-size:12px; color:var(--wl-accent); text-decoration:underline; cursor:pointer; }
+.wl-link-btn:disabled { opacity:.5; cursor:not-allowed; }
+.wl-link-btn:focus-visible { outline:2px solid var(--wl-accent); outline-offset:2px; }
+.wl-feedback-actions { display:flex; align-items:center; gap:8px; margin-top:10px; }
+/* <a> 当按钮用时没有 <button> 的默认盒模型，补上同样的外观 */
+.wl-feedback-issue { display:inline-flex; align-items:center; height:34px; box-sizing:border-box; padding:0 14px; border:1px solid var(--wl-control); border-radius:var(--wl-r-ctl); background:var(--wl-surface); color:var(--wl-text); font-size:13px; line-height:1; text-decoration:none; }
+.wl-feedback-issue:hover { background:var(--wl-raised); }
+.wl-feedback-status { margin:10px 0 0; font-size:13px; }
+.wl-feedback-status.is-ok { color:var(--wl-positive); font-weight:500; }
+.wl-feedback-status.is-bad { color:var(--wl-neg-ink); }
+/* 成功回执：按钮从「主操作」变成「已完成」。保留绿边而不是整块变绿，
+ * 免得和「发送中」的忙碌态混淆；文字本身已改成「已发送」。
+ * opacity:1 是必须的——:disabled 的 .5 会把它又糊成灰色。 */
+.wl-btn.primary.wl-feedback-sent { border-color:var(--wl-positive); background:transparent; color:var(--wl-positive); opacity:1; cursor:default; }
+
 /* ---------- 日期范围 ---------- */
 .wl-range { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .wl-range-inputs { display:inline-flex; align-items:center; gap:6px; }
@@ -924,6 +1234,94 @@ function safeError(e) {
 
 function pad2(n) {
   return String(n).padStart(2, "0");
+}
+
+/** 给桥接调用加一层超时。宿主侧若一直挂着，界面不能永远停在「发送中…」。 */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label + " timeout")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+/** 宿主版本。老版本宿主可能没有这一项，取不到就留空，不能因此发不出反馈。 */
+function hostAppVersion(ctx) {
+  try {
+    return ctx && ctx.host && typeof ctx.host.appVersion === "string" ? ctx.host.appVersion : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 发一条反馈到中转。返回 describeFeedbackResult 的归一化结果。
+ *
+ * 不复用扫描用的 HTTP 逻辑：反馈是 POST，连接层重试会把同一条内容发两遍——
+ * 用户看到「发送失败」再点一次，比静默重复更可控。
+ */
+async function sendFeedback(ctx, text) {
+  const payload = buildFeedbackPayload({
+    text,
+    pluginId: PLUGIN_ID,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "POST",
+        url: FEEDBACK_ENDPOINT + "/feedback",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "ccgui-worklog/" + ctx.version,
+        },
+        body: JSON.stringify(payload),
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "feedback"
+    );
+    return describeFeedbackResult({ status: Number(res && res.status) || 0, body: res && res.body });
+  } catch (error) {
+    return describeFeedbackResult({ error });
+  }
+}
+
+/**
+ * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住发反馈，
+ * 但要让界面知道「是连不上」而不是「额度紧张」，两句话说给用户听的意思完全不同。
+ */
+async function fetchQuota(ctx) {
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "GET",
+        url: FEEDBACK_ENDPOINT + "/quota",
+        headers: { "User-Agent": "ccgui-worklog/" + ctx.version },
+        body: null,
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "quota"
+    );
+    const status = Number(res && res.status) || 0;
+    if (!(status >= 200 && status < 300)) return { offline: true };
+    const body = res && typeof res.body === "string" ? res.body : "";
+    const data = body ? JSON.parse(body) : null;
+    // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/"" 读成 0，
+    // 界面会说「今天的额度已用完」。
+    const remaining = data ? quotaCount(data.remaining) : null;
+    return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
+  } catch {
+    return { offline: true };
+  }
 }
 
 function todayStr() {
@@ -4813,6 +5211,195 @@ async function revokeUnusedGrants() {
   for (const path of [...grantIds.keys()]) await revokeUnusedGrant(path);
 }
 
+function FeedbackSection() {
+  const R = appCtx.react;
+  const ctx = appCtx;
+
+  const textState = R.useState("");
+  const text = textState[0];
+  const setText = textState[1];
+  // "" -> "sending" -> "sent"/"error"
+  const sendState = R.useState("");
+  const sendStatus = sendState[0];
+  const setSendStatus = sendState[1];
+  const resultState = R.useState(null);
+  const result = resultState[0];
+  const setResult = resultState[1];
+  const quotaState = R.useState(null);
+  const quota = quotaState[0];
+  const setQuota = quotaState[1];
+  const quotaTried = R.useRef(false);
+  // 同步的在途标志。canSend 是渲染时的闭包值，同一 tick 内两次触发都会
+  // 读到旧的 sendStatus=""，只在状态里防不住双击。
+  const sendingRef = R.useRef(false);
+
+  // 只在第一次打开设置页时查额度。查不到就保持 {offline:true}，UI 说明是
+  // 「连不上」而不是「额度紧张」——两句话对用户的意思完全不同。
+  async function loadQuota() {
+    const q = await fetchQuota(ctx);
+    setQuota(q);
+    return q;
+  }
+
+  R.useEffect(() => {
+    if (quotaTried.current) return;
+    quotaTried.current = true;
+    void loadQuota();
+    // 只在挂载时查一次；之后由「重试」按钮或发送结果更新。
+  }, []);
+
+  const trimmed = normaliseFeedbackText(text);
+  const canSend = trimmed.length > 0 && sendStatus !== "sending";
+
+  const issueUrl = buildIssueUrl({
+    repo: FEEDBACK_REPO,
+    pluginName: FEEDBACK_PLUGIN_NAME,
+    text: trimmed,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+
+  async function submit() {
+    // sendingRef 是同步的：同一 tick 内两次触发都会读到 true，挡住双击。
+    // sendStatus 要等重渲染才更新，靠它挡不住。
+    if (!canSend || sendingRef.current) return;
+    sendingRef.current = true;
+    const submitted = trimmed;
+    setSendStatus("sending");
+    setResult(null);
+
+    let r;
+    try {
+      r = await sendFeedback(ctx, submitted);
+    } finally {
+      sendingRef.current = false;
+    }
+
+    setSendStatus(r.ok ? "sent" : "error");
+    setResult(r);
+    if (!r.ok) return;
+
+    // 只清掉「这次发出去的那段」。发送期间用户可能又敲了内容（那几个请求往返
+    // 里 textarea 没禁用），直接清空会把他新写的也抹掉。
+    setText((cur) => (cur === submitted ? "" : cur));
+
+    // 额度优先用服务端回传的真实值。查额度时失败了也不要紧——成功响应里
+    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。没有回传就自减一格。
+    setQuota((prev) => nextQuota(prev, r.remaining));
+  }
+
+  const quotaText = describeQuota(quota);
+  const statusText =
+    sendStatus === "sending" ? "发送中…" : result ? result.message : "";
+
+  // 成功时正文被清空，按钮会变成不可点的死按钮。若文案还停在「发送反馈」，
+  // 用户看到的就是「点了没反应」——回执必须落在按钮自己身上。
+  const sendLabel =
+    sendStatus === "sending" ? "发送中…" : sendStatus === "sent" ? "已发送" : "发送反馈";
+
+  return h(
+    "section",
+    { className: "wl-section" },
+    h(
+      "div",
+      { className: "wl-section-label" },
+      h("h2", null, "反馈"),
+      h("p", null, "遇到问题或想提建议，两种方式任选其一。")
+    ),
+    h(
+      "div",
+      { className: "wl-section-panel" },
+      h("textarea", {
+        className: "wl-input wl-feedback-text",
+        value: text,
+        rows: 5,
+        maxLength: TEXT_LIMIT,
+        placeholder: "描述问题或建议…（最多 " + TEXT_LIMIT + " 字）",
+        spellCheck: false,
+        "aria-label": "反馈正文",
+        onChange: (e) => {
+          setText(e.target.value);
+          // 重新输入等于开了一条新反馈：上一条的回执（成功或失败）都该撤掉，
+          // 否则按钮已经回到「发送反馈」，下面却还写着「反馈已发送」。
+          if (sendStatus !== "sending") {
+            setSendStatus("");
+            setResult(null);
+          }
+        },
+      }),
+      h(
+        "div",
+        { className: "wl-feedback-row" },
+        h("span", { className: "wl-hint wl-feedback-count" }, text.length + " / " + TEXT_LIMIT),
+        h(
+          "span",
+          { className: "wl-hint wl-feedback-quota" },
+          quotaText.message,
+          // 额度查不到 / 用完了都给一条重试路径，否则用户只能重开设置页。
+          quotaText.canRetry
+            ? h(
+                "button",
+                {
+                  type: "button",
+                  className: "wl-link-btn wl-feedback-quota-retry",
+                  disabled: sendStatus === "sending",
+                  onClick: () => void loadQuota(),
+                },
+                "重试"
+              )
+            : null
+        )
+      ),
+      h(
+        "div",
+        { className: "wl-feedback-actions" },
+        h(
+          "a",
+          {
+            className: "wl-feedback-issue",
+            href: issueUrl,
+            target: "_blank",
+            rel: "noreferrer noopener",
+            title: "在浏览器里打开预填好的 Issue 页面",
+          },
+          "通过 GitHub 提 Issue"
+        ),
+        h(
+          "button",
+          {
+            type: "button",
+            className:
+              "wl-btn primary wl-feedback-send" +
+              (sendStatus === "sent" ? " wl-feedback-sent" : ""),
+            disabled: !canSend,
+            onClick: () => void submit(),
+          },
+          sendLabel
+        )
+      ),
+      statusText
+        ? h(
+            "p",
+            {
+              className:
+                "wl-note-line wl-feedback-status" +
+                (sendStatus === "sent" ? " is-ok" : "") +
+                (sendStatus === "error" ? " is-bad" : ""),
+              role: "status",
+              "aria-live": "polite",
+            },
+            statusText
+          )
+        : null,
+      h(
+        "p",
+        { className: "wl-hint" },
+        "发送的内容只有这段文字、插件版本与 CC GUI 版本。不含会话、代码或本机路径。"
+      )
+    )
+  );
+}
+
 function SettingsSection() {
   const R = appCtx.react;
   const snap = useSnap();  const formState = R.useState(null);
@@ -5444,6 +6031,7 @@ function SettingsSection() {
         )
       )
     ),
+    h(FeedbackSection, null),
     h(
       "div",
       { className: "wl-save-bar" },

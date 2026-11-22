@@ -146,6 +146,16 @@ finish();
 function finish() {
   for (const w of warnings) console.warn("WARN  " + w);
   for (const e of errors) console.error("FAIL  " + e);
+// manifest.json 是发版与宿主加载的唯一真相；package.json 只给本地脚本用。
+// 两份版本漂开时，打出来的 tag 与实际安装的版本对不上，查问题会绕远路。
+{
+  const pkg = readJson('package.json');
+  const manifest = readJson('manifest.json');
+  if (pkg && manifest && pkg.version && manifest.version && pkg.version !== manifest.version) {
+    fail('package.json 版本 ' + pkg.version + ' 与 manifest.json ' + manifest.version + ' 不一致');
+  }
+}
+
   console.log(`\nRESULT=${errors.length === 0 ? "VALIDATE_OK" : "VALIDATE_FAIL"} errors=${errors.length} warnings=${warnings.length}`);
   process.exit(errors.length === 0 ? 0 : 1);
 }

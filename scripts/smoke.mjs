@@ -132,7 +132,8 @@ const states = new Map();
 let stateIdx = 0;
 let refIdx = 0;
 let effectIdx = 0;
-const refs = [];
+// 用 let 而不是 const：renderFresh 必须整体换新数组（见那里的注释）
+let refs = [];
 const pendingEffects = [];
 // hook 槽位按「组件实例」分域，不能整棵树共用一个序号：
 // 真实 React 按 fiber 存状态，兄弟组件多一个少一个都不影响别人；
@@ -243,6 +244,10 @@ function expand(node) {
 /**
  * 全新渲染：清空组件状态，默认不执行 effect。
  * 测试里每 50ms 轮询一次渲染，若每次都跑 checkEnv 会反复启动子进程。
+ *
+ * 注意 ref 的清法：槽位键是 `domain|idx` 字符串，`refs.length = 0` 只清数字
+ * 索引，字符串键会留到下一次挂载——那样 useRef 的「只在挂载时跑一次」标志
+ * （quotaTried 之类）会被当成还在，重挂载就不再跑初始化。必须整体换新数组。
  */
 function renderFresh(comp, props, opts) {
   const prev = effectStores.get(comp);
@@ -250,7 +255,7 @@ function renderFresh(comp, props, opts) {
   effectStore = new Map();
   effectStores.set(comp, effectStore);
   states.clear();
-  refs.length = 0;
+  refs = [];
   stateIdx = 0;
   refIdx = 0;
   effectIdx = 0;
@@ -338,6 +343,9 @@ let tabDef = null;
 let navDef = null;
 let settingsDef = null;
 let commandDef = null;
+// 反馈相关的桥接替身：默认全部拒绝（等同「权限未生效」），由各条用例自己设。
+const httpCalls = [];
+let httpResponder = null;
 
 const eventHandlers = new Set();
 function emit(ev) {
@@ -467,6 +475,11 @@ const ctx = {
   },
   bridge: {
     invoke: async (cmd, args) => {
+      if (cmd === "plugin_http_request") {
+        httpCalls.push(args);
+        if (httpResponder) return httpResponder(args);
+        throw new Error("network:ccgui-feedback.2653990378.workers.dev not granted");
+      }
       if (cmd !== "plugin_exec_run") throw new Error("unexpected bridge command " + cmd);
       execCalls.push({ bin: args.bin, args: args.args });
       const out = execFileSync(args.bin, args.args, {
@@ -1794,6 +1807,189 @@ check("引擎运行目录留空时显示插件数据目录的真实路径", () =
   assert.ok(texts[0].includes(storageDir), "应显示真实路径 " + storageDir);
 });
 dispose5();
+
+/* ------------------------------------------------------------ 反馈区 */
+
+// dispose 会把 appCtx 置回 null，反馈用例需要重新激活一次。
+const dispose6 = mod.default(ctx);
+await sleep(200);
+
+// 每条用例都从「当前设置页状态」出发：renderKeep 保留状态，反馈组件的
+// hook 槽位按组件名分域，不会和设置表单互相串。
+async function mountFeedback(responder) {
+  httpResponder = responder;
+  httpCalls.length = 0;
+  // effects 要跑一次：额度只在挂载时查一次。查询是异步的，等它落定后
+  // 再重渲染一遍，否则拿到的还是「还没查」的那一帧。
+  renderFresh(settingsDef.component, {}, { effects: true });
+  await sleep(80);
+  return renderKeep(settingsDef.component);
+}
+
+// findByText 只认 button；Issue 入口是 <a>，单独找一个。
+function findLink(tree, text) {
+  let hit = null;
+  walk(tree, (n) => {
+    if (!hit && n.type === "a" && textOf(n).includes(text)) hit = n;
+  });
+  return hit;
+}
+
+const okQuota = () => ({ status: 200, body: JSON.stringify({ remaining: 25, dailyLimit: 30 }) });
+
+await (async () => {
+  const tree = await mountFeedback((args) =>
+    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: JSON.stringify({ ok: true, remaining: 24 }) },
+  );
+
+  check("反馈：两种渠道都在，且请求体只有白名单字段", () => {
+    const box = byClass(tree, "wl-feedback-text");
+    assert.ok(box, "应有反馈输入框");
+    assert.equal(box.props.maxLength, 1000);
+    const link = findLink(tree, "通过 GitHub 提 Issue");
+    assert.ok(link, "应有 Issue 链接");
+    assert.match(link.props.href, /github\.com\/renhao-wan\/ccgui-plugin-worklog\/issues\/new\?/);
+    assert.match(link.props.href, /title=%5B%E5%8F%8D%E9%A6%88%5D/, "标题应预填并编码");
+
+    // 挂载时查过一次额度
+    const quotaCall = httpCalls.find((c) => String(c.url).endsWith("/quota"));
+    assert.ok(quotaCall, "挂载时应查一次额度");
+    assert.equal(httpCalls.length, 1, "挂载时只该查额度，不该发反馈");
+  });
+
+  check("反馈：额度文案用服务端回传的真实值", () => {
+    assert.match(textOf(byClass(tree, "wl-feedback-quota")), /25/);
+  });
+
+  const filled = await (async () => {
+    // 写内容：onChange 是唯一的输入通道
+    byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({
+      target: { value: "点「生成」后一直停在扫描中\nError: timeout\n    at scan (scan.mjs:12)" },
+    });
+    const t = renderKeep(settingsDef.component);
+    return t;
+  })();
+
+  check("反馈：正文保留换行与堆栈缩进", () => {
+    const box = byClass(filled, "wl-feedback-text");
+    assert.match(box.props.value, /\nError: timeout\n {4}at scan/);
+    assert.match(textOf(byClass(filled, "wl-feedback-count")), /^\d+\s*\/\s*1000$/);
+  });
+
+  const btn = byClass(filled, "wl-feedback-send");
+  assert.ok(btn, "应有发送按钮");
+  assert.equal(btn.props.disabled, false, "有内容时应可发送");
+  btn.props.onClick();
+  btn.props.onClick(); // 同一 tick 连点两次
+  await sleep(120);
+
+  const sentTree = renderKeep(settingsDef.component);
+  check("反馈：同一 tick 连点两次只发一条", () => {
+    const posts = httpCalls.filter((c) => String(c.url).endsWith("/feedback"));
+    assert.equal(posts.length, 1, "应只发出 1 条，实际 " + posts.length);
+    const payload = JSON.parse(posts[0].body);
+    assert.deepEqual(Object.keys(payload).sort(), ["hostVersion", "pluginId", "pluginVersion", "text", "ts"]);
+    assert.equal(payload.pluginId, "worklog");
+    assert.equal(payload.hostVersion, "1.2.4");
+    assert.equal(posts[0].method, "POST");
+    assert.match(String(posts[0].headers["User-Agent"]), /^ccgui-worklog\//);
+  });
+
+  check("反馈：成功后清空正文、按钮回到可用态且额度用回传值", () => {
+    assert.equal(byClass(sentTree, "wl-feedback-text").props.value, "");
+    assert.match(textOf(byClass(sentTree, "wl-feedback-send")), /已发送/);
+    assert.match(textOf(byClass(sentTree, "wl-feedback-quota")), /24/);
+    assert.match(textOf(byClass(sentTree, "wl-feedback-status")), /已发送/);
+  });
+})();
+
+await (async () => {
+  // 额度查不到（500），但发送成功并回传 remaining
+  const tree = await mountFeedback((args) =>
+    args.url.endsWith("/quota") ? { status: 500, body: "boom" } : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) },
+  );
+
+  check("反馈：额度查不到时说明是连不上，并给重试入口", () => {
+    assert.match(textOf(byClass(tree, "wl-feedback-quota")), /连不上|暂时/);
+    assert.ok(byClass(tree, "wl-feedback-quota-retry"), "应提供重试按钮");
+  });
+
+  // 重试按钮真的会再查一次
+  httpResponder = (args) =>
+    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) };
+  const before = httpCalls.filter((c) => String(c.url).endsWith("/quota")).length;
+  byClass(renderKeep(settingsDef.component), "wl-feedback-quota-retry").props.onClick();
+  await sleep(120);
+  const retried = renderKeep(settingsDef.component);
+  check("反馈：重试按钮会重新查额度，查到后收起重试入口", () => {
+    assert.equal(httpCalls.filter((c) => String(c.url).endsWith("/quota")).length, before + 1);
+    assert.match(textOf(byClass(retried, "wl-feedback-quota")), /25/);
+    assert.equal(byClass(retried, "wl-feedback-quota-retry"), null, "有额度时不该再挂重试按钮");
+  });
+
+  // 再挂一次「查不到」，验证发送成功会顺手纠正额度区
+  httpResponder = (args) =>
+    args.url.endsWith("/quota") ? { status: 500, body: "boom" } : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) };
+  byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "一条反馈" } });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
+  await sleep(120);
+  const after = renderKeep(settingsDef.component);
+  check("反馈：额度查不到但发送成功，额度区不再停留在「连不上」", () => {
+    assert.match(textOf(byClass(after, "wl-feedback-quota")), /23/);
+    assert.doesNotMatch(textOf(byClass(after, "wl-feedback-quota")), /连不上/);
+  });
+})();
+
+await (async () => {
+  await mountFeedback((args) =>
+    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: "<html>请登录校园网</html>" },
+  );
+  byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "被劫持" } });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
+  await sleep(120);
+  const t = renderKeep(settingsDef.component);
+  check("反馈：200 但正文不是我们的 JSON 时不当成功", () => {
+    assert.doesNotMatch(textOf(t), /已发送/, "劫持页不能判成功");
+    assert.match(textOf(byClass(t, "wl-feedback-status")), /GitHub Issue/);
+    assert.notEqual(byClass(t, "wl-feedback-text").props.value, "", "失败时正文必须留着");
+  });
+})();
+
+await (async () => {
+  await mountFeedback((args) => {
+    if (args.url.endsWith("/quota")) return okQuota();
+    throw new Error("net::ERR_NAME_NOT_RESOLVED");
+  });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "断网" } });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
+  await sleep(120);
+  const t = renderKeep(settingsDef.component);
+  check("反馈：网络不通时提示检查网络或代理", () => {
+    const s = textOf(byClass(t, "wl-feedback-status"));
+    assert.match(s, /网络|代理/);
+    assert.match(s, /GitHub Issue/);
+  });
+})();
+
+await (async () => {
+  await mountFeedback((args) => {
+    if (args.url.endsWith("/quota")) return okQuota();
+    return { status: 429, body: JSON.stringify({ ok: false, error: "rate_limited", kind: "burst", remaining: 25 }) };
+  });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "发太快" } });
+  byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
+  await sleep(120);
+  const t = renderKeep(settingsDef.component);
+  check("反馈：突发限流说「稍等几分钟」，不谎报今天用完", () => {
+    const s = textOf(byClass(t, "wl-feedback-status"));
+    assert.match(s, /太快|稍候|分钟/);
+    assert.doesNotMatch(s, /明天/);
+    assert.match(textOf(byClass(t, "wl-feedback-quota")), /25/);
+  });
+})();
+
+httpResponder = null;
+dispose6();
 
 /* ------------------------------------------------------------ 汇总 */
 
