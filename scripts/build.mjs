@@ -5,12 +5,14 @@
  * 插件以 ESM blob 加载，不能 import 兄弟文件，所以扫描器必须以字符串内联。
  * 用 JSON.stringify 生成字面量，反引号、${} 与反斜杠都不需要额外转义。
  *
- * 纯函数库（src/lib/*.mjs）走另一条路：它们要在单测里直接 import，所以
- * 内联方式是「剥掉 export 前缀后拼进同一作用域」，和 github-trending 一致。
+ * 纯函数库走另一条路：它们要在单测里直接 import，所以内联方式是「剥掉
+ * export 前缀后拼进同一作用域」，和 github-trending 一致。库有两个来源：
+ * npm 依赖 ccgui-plugin-shared（四插件共用），以及本插件私有的 src/lib。
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -18,7 +20,35 @@ const ROOT = path.join(HERE, "..");
 const MARKER = "/*__SCAN_SOURCE__*/";
 const LIB_START = "/*__LIB_SOURCE__*/";
 const LIB_END = "/*__LIB_SOURCE_END__*/";
+const require = createRequire(import.meta.url);
+
+// 顺序即内联顺序，同时决定 stripLocalImports 放行哪些兄弟 import。
 const LIB_ORDER = ["feedback", "feedback-net", "feedback-ui", "markdown", "markdown-view"];
+
+// 这些名字从 ccgui-plugin-shared 取；其余是本插件私有的 src/lib/*.mjs。
+const SHARED = new Set(["feedback", "feedback-net", "feedback-ui", "markdown", "markdown-view"]);
+
+/**
+ * 读一个库的源码。共用库从 node_modules 解析，私有库读本地文件。
+ *
+ * 用 require.resolve 而不是拼 node_modules/<name>/src/<name>.mjs：
+ * 包的 exports 映射才是入口的真相，拼路径等于把包的目录结构写死一份在这里。
+ */
+function readLib(name) {
+  if (!SHARED.has(name)) {
+    const file = path.join(ROOT, "src", "lib", name + ".mjs");
+    if (!fs.existsSync(file)) throw new Error(`缺少 src/lib/${name}.mjs`);
+    return fs.readFileSync(file, "utf8");
+  }
+  try {
+    return fs.readFileSync(require.resolve("ccgui-plugin-shared/" + name), "utf8");
+  } catch (err) {
+    throw new Error(
+      `读不到共用库 ccgui-plugin-shared/${name}（${err.message}）。` +
+        "先跑 npm install——这个包是 npm 依赖，不在仓库里。",
+    );
+  }
+}
 
 function stripExports(source) {
   // 只动行首的 export 关键字，避免误伤字符串里的 "export"。
@@ -60,7 +90,7 @@ if (out.includes(LIB_START)) {
   if (endAt < startAt) throw new Error("内联标记顺序颠倒");
   const chunks = [];
   for (const name of LIB_ORDER) {
-    const raw = fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8");
+    const raw = readLib(name);
     const src = stripLocalImports(raw, name);
     // 兄弟库的 import 上面已经剥掉了；还剩 import 就说明是外部依赖，
     // 内联进单文件产物后宿主加载会直接失败，必须拦在这里。
@@ -81,8 +111,7 @@ fs.writeFileSync(path.join(ROOT, "main.js"), spliced, "utf8");
 
 // 自检：内联内容必须与源文件逐字一致（去掉 export 前缀与兄弟 import 之后）。
 for (const name of LIB_ORDER) {
-  const raw = fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8");
-  const src = stripExports(stripLocalImports(raw, name)).trim();
+  const src = stripExports(stripLocalImports(readLib(name), name)).trim();
   if (!spliced.includes(src)) throw new Error(`内联校验失败：${name}.mjs 与产物不一致`);
 }
 if (spliced.includes(LIB_START) || spliced.includes(LIB_END)) throw new Error("产物里残留内联标记");

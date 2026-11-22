@@ -1,0 +1,9 @@
+# 仓库统一 LF。
+#
+# main.js 是由 src/main.head.js + src/lib/*.mjs + ccgui-plugin-shared 逐字内联
+# 生成的产物。只要有一处按平台换成 CRLF，构建结果就与 CI 不一致，
+# `git diff --exit-code main.js` 在 Windows 上会假性失败。
+#
+# 共用库（ccgui-plugin-shared）已用 eol=lf 规范化，这里必须对齐，
+# 否则产物会混入两种换行符。
+* text=auto eol=lf
