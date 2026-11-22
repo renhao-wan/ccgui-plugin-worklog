@@ -96,6 +96,23 @@ function grab(source, name) {
   return source.slice(begin);
 }
 
+// 在目标仓库里找同名库文件。
+//
+// 不能用 path.dirname(TARGET) 拼：TARGET 是仓库根的 main.js，拼出来的
+// REPO/feedback-ui.mjs 永远不存在——几段检查因此静默跳过（markdown 那段
+// 没有兜底，直接 continue，改了文件也报 IN_SYNC）。构建型插件的库在
+// src/lib/ 下，无构建插件没有独立文件、纯函数内联在 main.js 里。
+function findLib(name) {
+  const dirs = [path.join(REPO, 'src', 'lib'), path.dirname(TARGET)];
+  for (const dir of dirs) {
+    const p = path.join(dir, name + '.mjs');
+    if (p !== TARGET && fs.existsSync(p)) {
+      return { path: p, src: fs.readFileSync(p, 'utf8'), label: path.basename(p) };
+    }
+  }
+  return null;
+}
+
 if (!fs.existsSync(BASE)) {
   // 本地缺基准可以跳过；CI 里跳过就等于没检查，所以只认显式声明的环境。
   if (process.env.CI) {
@@ -139,13 +156,9 @@ for (const name of NAMES) {
 // 这段最容易「改一处忘三处」——本次 quotaCount 的 bug 就同时存在于四处，
 // 只因为纯函数层被查才一次抓到；网络层此前完全没人拦。
 const NET_BASE = path.join(path.dirname(BASE), "feedback-net.mjs");
-// 无构建插件里网络层内联在 main.js；有构建的插件是同目录的 feedback-net.mjs。
-// 目标目录下没有同名文件时，退回主目标文件（内联形态）。
-const netTargetPath = path.join(path.dirname(TARGET), "feedback-net.mjs");
-const netTarget =
-  netTargetPath !== TARGET && fs.existsSync(netTargetPath)
-    ? { src: fs.readFileSync(netTargetPath, "utf8"), label: path.basename(netTargetPath) }
-    : { src: targetSrc, label: path.basename(TARGET) };
+// 有构建的插件是 src/lib/feedback-net.mjs；无构建插件没有独立文件，退回 main.js。
+const netFound = findLib("feedback-net");
+const netTarget = netFound || { src: targetSrc, label: path.basename(TARGET) };
 
 if (fs.existsSync(NET_BASE)) {
   const netBase = fs.readFileSync(NET_BASE, "utf8");
@@ -164,11 +177,8 @@ if (fs.existsSync(NET_BASE)) {
 // 不查这一段就等于给新抽出来的代码开了个口子——里面恰好是最易错的那几处：
 // sendingRef 挡双击、成功后只清「这次发出去的那段」、额度不能被 null 读成 0。
 const UI_BASE = path.join(path.dirname(BASE), "feedback-ui.mjs");
-const uiTargetPath = path.join(path.dirname(TARGET), "feedback-ui.mjs");
-const uiTarget =
-  uiTargetPath !== TARGET && fs.existsSync(uiTargetPath)
-    ? { src: fs.readFileSync(uiTargetPath, "utf8"), label: path.basename(uiTargetPath) }
-    : { src: targetSrc, label: path.basename(TARGET) };
+const uiFound = findLib("feedback-ui");
+const uiTarget = uiFound || { src: targetSrc, label: path.basename(TARGET) };
 
 if (fs.existsSync(UI_BASE)) {
   const uiBase = fs.readFileSync(UI_BASE, "utf8");
@@ -181,6 +191,27 @@ if (fs.existsSync(UI_BASE)) {
   }
 } else if (process.env.CI) {
   diffs.push("找不到基准 feedback-ui.mjs（CI 里请 checkout github-trending 并设置 FEEDBACK_BASE）");
+}
+
+// Markdown 解析与渲染：两个构建型插件各有一份 src/lib/markdown*.mjs。
+// 无构建插件（slash / cli）不渲染 Markdown，连 src/lib 目录都没有，
+// 所以按「目标仓库有没有 src/lib」来判断该不该查——只要它是构建型
+// 插件，缺文件就是漂移，不能静默跳过（上一版正是这么漏掉的）。
+const hasLibDir = fs.existsSync(path.join(REPO, "src", "lib"));
+for (const name of ["markdown", "markdown-view"]) {
+  const mdBasePath = path.join(path.dirname(BASE), name + ".mjs");
+  if (!fs.existsSync(mdBasePath)) continue;
+  if (!hasLibDir) continue;
+  const mdTargetPath = path.join(REPO, "src", "lib", name + ".mjs");
+  if (!fs.existsSync(mdTargetPath)) {
+    diffs.push(`${name}.mjs：src/lib/ 里缺这个文件（构建型插件必须与基准一致）`);
+    continue;
+  }
+  const a = fs.readFileSync(mdBasePath, "utf8");
+  const b = fs.readFileSync(mdTargetPath, "utf8");
+  if (normalize(a) !== normalize(b)) {
+    diffs.push(`${name}.mjs：${path.relative(REPO, mdTargetPath)} 里与基准不一致`);
+  }
 }
 
 if (diffs.length === 0) {
