@@ -21,6 +21,10 @@ jobs:
         with:
           node-version: 20
 
+      # 共用库是 npm 依赖（ccgui-plugin-shared），必须装了才能 build。
+      - name: Install dependencies
+        run: npm ci
+
       - name: Build main.js from sources
         run: node scripts/build.mjs
 
