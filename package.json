@@ -10,12 +10,13 @@
     "smoke": "node scripts/smoke.mjs",
     "validate": "node scripts/validate-manifest.mjs",
     "check": "npm run build && npm test && npm run smoke && npm run validate",
-    "scan": "node scripts/scan.mjs"
+    "scan": "node scripts/scan.mjs",
+    "shared:check": "shared-version"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.0"
+    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.1"
   }
 }

@@ -20,6 +20,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # 共用库钉在 tag 上，漂移从文件层移到了版本层。落后于包的最新 tag
+      # 只提醒不拦（退出码恒 0），但会直接显示在这一步的输出里。
+      - name: Check shared library version
+        run: npm run shared:check
+
       - name: Build main.js from sources
         run: node scripts/build.mjs
 
