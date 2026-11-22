@@ -160,6 +160,29 @@ if (fs.existsSync(NET_BASE)) {
   diffs.push("找不到基准 feedback-net.mjs（CI 里请 checkout github-trending 并设置 FEEDBACK_BASE）");
 }
 
+// 行为层：useFeedbackForm 整段内联（无构建插件）或整文件复制（有构建插件）。
+// 不查这一段就等于给新抽出来的代码开了个口子——里面恰好是最易错的那几处：
+// sendingRef 挡双击、成功后只清「这次发出去的那段」、额度不能被 null 读成 0。
+const UI_BASE = path.join(path.dirname(BASE), "feedback-ui.mjs");
+const uiTargetPath = path.join(path.dirname(TARGET), "feedback-ui.mjs");
+const uiTarget =
+  uiTargetPath !== TARGET && fs.existsSync(uiTargetPath)
+    ? { src: fs.readFileSync(uiTargetPath, "utf8"), label: path.basename(uiTargetPath) }
+    : { src: targetSrc, label: path.basename(TARGET) };
+
+if (fs.existsSync(UI_BASE)) {
+  const uiBase = fs.readFileSync(UI_BASE, "utf8");
+  for (const name of ["useFeedbackForm"]) {
+    const a = grab(uiBase, name);
+    const b = grab(uiTarget.src, name);
+    if (a === null) diffs.push(`${name}：基准 feedback-ui.mjs 里找不到`);
+    else if (b === null) diffs.push(`${name}：${uiTarget.label} 里找不到`);
+    else if (normalize(a) !== normalize(b)) diffs.push(`${name}：${uiTarget.label} 里与基准 feedback-ui.mjs 不一致`);
+  }
+} else if (process.env.CI) {
+  diffs.push("找不到基准 feedback-ui.mjs（CI 里请 checkout github-trending 并设置 FEEDBACK_BASE）");
+}
+
 if (diffs.length === 0) {
   console.log('RESULT=FEEDBACK_IN_SYNC');
   process.exit(0);

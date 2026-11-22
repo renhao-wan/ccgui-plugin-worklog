@@ -18,11 +18,30 @@ const ROOT = path.join(HERE, "..");
 const MARKER = "/*__SCAN_SOURCE__*/";
 const LIB_START = "/*__LIB_SOURCE__*/";
 const LIB_END = "/*__LIB_SOURCE_END__*/";
-const LIB_ORDER = ["feedback", "feedback-net"];
+const LIB_ORDER = ["feedback", "feedback-net", "feedback-ui"];
 
 function stripExports(source) {
   // 只动行首的 export 关键字，避免误伤字符串里的 "export"。
   return source.replace(/^export\s+(?=(?:function|const|let|var|class)\s)/gm, "");
+}
+
+/**
+ * 剥掉「指向兄弟 lib 的 import」。
+ *
+ * 库文件内联进同一个作用域后，这些 import 语句就成了语法错误。只放行
+ * `./name.mjs` 这一种形状：真实的外部依赖仍然要拦，否则会产出一个
+ * 宿主加载即失败的 main.js。
+ */
+function stripLocalImports(source, name) {
+  return source.replace(
+    /^import\s*\{([^}]*)\}\s*from\s*["']\.\/([A-Za-z0-9_-]+)\.mjs["'];?[ \t]*\n/gm,
+    (_all, _names, dep) => {
+      if (!LIB_ORDER.includes(dep)) {
+        throw new Error(`${name}.mjs 引用了不在 LIB_ORDER 里的库：./${dep}.mjs`);
+      }
+      return "";
+    },
+  );
 }
 
 const head = fs.readFileSync(path.join(ROOT, "src", "main.head.js"), "utf8");
@@ -41,8 +60,11 @@ if (out.includes(LIB_START)) {
   if (endAt < startAt) throw new Error("内联标记顺序颠倒");
   const chunks = [];
   for (const name of LIB_ORDER) {
-    const src = fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8");
-    if (/\bimport\s/.test(src)) throw new Error(`${name}.mjs 必须零 import`);
+    const raw = fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8");
+    const src = stripLocalImports(raw, name);
+    // 兄弟库的 import 上面已经剥掉了；还剩 import 就说明是外部依赖，
+    // 内联进单文件产物后宿主加载会直接失败，必须拦在这里。
+    if (/^\s*import\s/m.test(src)) throw new Error(`${name}.mjs 含无法内联的 import`);
     if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(src)) throw new Error(`${name}.mjs 含禁用写法`);
     chunks.push("// ---- src/lib/" + name + ".mjs ----\n" + stripExports(src).trim() + "\n");
   }
@@ -57,9 +79,10 @@ if (out.includes(LIB_START)) {
 const spliced = out.replace(MARKER, () => "const SCAN_SOURCE = " + JSON.stringify(scan) + ";");
 fs.writeFileSync(path.join(ROOT, "main.js"), spliced, "utf8");
 
-// 自检：内联内容必须与源文件逐字一致（去掉 export 前缀后）。
+// 自检：内联内容必须与源文件逐字一致（去掉 export 前缀与兄弟 import 之后）。
 for (const name of LIB_ORDER) {
-  const src = stripExports(fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8")).trim();
+  const raw = fs.readFileSync(path.join(ROOT, "src", "lib", name + ".mjs"), "utf8");
+  const src = stripExports(stripLocalImports(raw, name)).trim();
   if (!spliced.includes(src)) throw new Error(`内联校验失败：${name}.mjs 与产物不一致`);
 }
 if (spliced.includes(LIB_START) || spliced.includes(LIB_END)) throw new Error("产物里残留内联标记");
