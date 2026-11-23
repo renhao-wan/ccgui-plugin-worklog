@@ -1197,7 +1197,42 @@ const monday = (() => {
   d.setDate(d.getDate() - back);
   return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 })();
-const weekFile = "reports/" + monday + "_" + DATE + "-weekly.md";
+
+// 多日范围的用例不能挂在「本周」上：周一那天「本周一就是今天」，范围退化成单日，
+// 整组断言会崩（2026-11-23 就是周一，踩过一次）。改用「自定义」固定一个三天
+// 区间（今天往前两天到今天），与运行当天是星期几无关；区间含今天，fixture 里
+// 今天的会话照样扫得到。
+const MULTI_FROM = (() => {
+  const d = new Date(DAY);
+  d.setDate(d.getDate() - 2);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+})();
+const multiLabel = MULTI_FROM + " 至 " + DATE;
+const multiFile = "reports/" + MULTI_FROM + "_" + DATE + "-weekly.md";
+
+/** 「自定义」范围的两个日期框（className 都是 wl-input，type=date）。 */
+function rangeDateInputs(t) {
+  const box = byClass(t, "wl-range-inputs");
+  if (!box) return [];
+  const out = [];
+  walk(box, (n) => {
+    if (n.type === "input" && n.props && n.props.type === "date") out.push(n);
+  });
+  return out;
+}
+
+/** 切到「自定义」并把区间设成 MULTI_FROM 至 DATE，返回时范围已落定。 */
+async function chooseMultiDayRange() {
+  findByText(renderFresh(tabDef.component), "自定义").props.onClick();
+  await sleep(60);
+  let inputs = rangeDateInputs(renderFresh(tabDef.component));
+  if (inputs.length !== 2) throw new Error("自定义范围应有两个日期框，实际 " + inputs.length);
+  inputs[0].props.onChange({ target: { value: MULTI_FROM } });
+  await sleep(120);
+  inputs = rangeDateInputs(renderFresh(tabDef.component));
+  inputs[1].props.onChange({ target: { value: DATE } });
+  await sleep(120);
+}
 
 check("页头提供单日 / 本周 / 自定义三种范围", () => {
   const t = renderFresh(tabDef.component);
@@ -1208,9 +1243,19 @@ check("页头提供单日 / 本周 / 自定义三种范围", () => {
 
 findByText(renderFresh(tabDef.component), "本周").props.onClick();
 await sleep(60);
-check("点「本周」把范围切到本周一至今天", () => {
+check("点「本周」切到本周一至今天（周一退化为单日）", () => {
   const t = textOf(renderFresh(tabDef.component));
-  assert.match(t, new RegExp(monday + " 至 " + DATE));
+  if (monday === DATE) {
+    // 今天就是本周一：本周只有今天，退化成单日是正确行为，不该报错。
+    assert.ok(!t.includes(" 至 "), "周一的本周就是今天，应显示为单日");
+  } else {
+    assert.match(t, new RegExp(monday + " 至 " + DATE));
+  }
+});
+
+await chooseMultiDayRange();
+check("切到自定义多日范围", () => {
+  assert.match(textOf(renderFresh(tabDef.component)), new RegExp(multiLabel));
 });
 
 findByText(renderFresh(tabDef.component), "扫描").props.onClick();
@@ -1226,7 +1271,7 @@ const lastNodeCall = execCalls.filter((c) => c.bin === "node").pop();
 check("多日范围把 --from/--to 传给扫描器", () => {
   assert.ok(lastNodeCall, "应调用过 node");
   const args = lastNodeCall.args.join(" ");
-  assert.ok(args.includes("--from " + monday), "应带 --from，实际 " + args);
+  assert.ok(args.includes("--from " + MULTI_FROM), "应带 --from，实际 " + args);
   assert.ok(args.includes("--to " + DATE), "应带 --to，实际 " + args);
 });
 
@@ -1256,7 +1301,7 @@ check("周报使用周报的提示词模板", () => {
   const opts = agentStarts[agentStarts.length - 1];
   assert.match(opts.prompt, /工作周报/);
   assert.match(opts.prompt, /本周产出/);
-  assert.match(opts.prompt, new RegExp(monday + " 至 " + DATE));
+  assert.match(opts.prompt, new RegExp(multiLabel));
 });
 
 // 保存一份多日报告，随后能从历史里点回来
@@ -1266,8 +1311,8 @@ byClass(renderKeep(tabDef.component), "wl-textarea").props.onChange({
 findByText(renderKeep(tabDef.component), "保存").props.onClick();
 await sleep(120);
 check("多日报告写进 from_to 文件名", () => {
-  const p = path.join(storageDir, weekFile);
-  assert.ok(fs.existsSync(p), "应有 " + weekFile);
+  const p = path.join(storageDir, multiFile);
+  assert.ok(fs.existsSync(p), "应有 " + multiFile);
   assert.match(fs.readFileSync(p, "utf8"), /本周周报/);
 });
 
@@ -1277,7 +1322,7 @@ findByText(renderFresh(tabDef.component), "单日").props.onClick();
 await sleep(80);
 check("切回单日后范围回到今天", () => {
   const t = textOf(renderFresh(tabDef.component));
-  assert.ok(!t.includes(monday + " 至 " + DATE), "不应还显示多日范围");
+  assert.ok(!t.includes(multiLabel), "不应还显示多日范围");
 });
 
 // 今天已经扫过一次：切回来时快照直接摆出来，不用再点「扫描」。
@@ -1318,7 +1363,7 @@ walk(historyTree, (n) => {
 check("报告历史按范围与口吻列已保存的报告", () => {
   assert.ok(historyRows.length >= 2, "应有单日与多日两份，实际 " + historyRows.length);
   const texts = historyRows.map((r) => textOf(r));
-  assert.ok(texts.some((t) => t.includes(monday + " 至 " + DATE)), "应列出本周这份");
+  assert.ok(texts.some((t) => t.includes(multiLabel)), "应列出这份多日报告");
 });
 
 // 攒到几十上百份时，列表要按月份分开、并限高滚动，不能把整页顶下去
@@ -1426,14 +1471,14 @@ check("宿主 list 语义变化时报告历史仍然读得到", () => {
 const panelBefore = renderFresh(tabDef.component);
 const areaBefore = byClass(panelBefore, "wl-textarea");
 const beforeValue = areaBefore ? String(areaBefore.props.value) : "";
-const weekRow = historyRows.find((r) => textOf(r).includes(monday + " 至 " + DATE));
+const weekRow = historyRows.find((r) => textOf(r).includes(multiLabel));
 weekRow.props.onClick();
 await sleep(200);
 check("点历史记录打开只读查看器", () => {
   const t = renderFresh(tabDef.component);
   const mask = byClass(t, "wl-viewer-mask");
   assert.ok(mask, "应出现查看器浮层");
-  assert.match(textOf(mask), new RegExp(monday + " 至 " + DATE), "标题应是那份报告的范围");
+  assert.match(textOf(mask), new RegExp(multiLabel), "标题应是那份报告的范围");
   const dialog = byClass(mask, "wl-viewer");
   assert.equal(dialog.props["aria-modal"], "true", "浮层应是模态对话框");
   assert.match(textOf(dialog), /本周周报/, "应显示报告正文");
@@ -1477,7 +1522,7 @@ await sleep(200);
 check("从查看器在面板中打开这份报告", () => {
   const t = renderFresh(tabDef.component);
   assert.equal(byClass(t, "wl-viewer-mask"), null, "点完应关闭浮层");
-  assert.match(textOf(t), new RegExp(monday + " 至 " + DATE));
+  assert.match(textOf(t), new RegExp(multiLabel));
   const area = byClass(t, "wl-textarea");
   assert.ok(area, "应显示报告内容");
   assert.match(area.props.value, /本周周报/);
