@@ -245,12 +245,23 @@ function quotaCount(v) {
  */
 function nextQuota(prev, fromServer) {
   const n = quotaCount(fromServer);
+  const fallback = normalizeFallback(prev);
   if (n !== null) {
-    return { remaining: n, dailyLimit: (prev && prev.dailyLimit) || 30 };
+    return { remaining: n, dailyLimit: (prev && prev.dailyLimit) || 1, fallbackRemaining: fallback };
   }
   const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
   if (prevRemaining === null) return prev;
-  return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+  return {
+    remaining: Math.max(0, prevRemaining - 1),
+    dailyLimit: prev.dailyLimit || 1,
+    fallbackRemaining: fallback,
+  };
+}
+
+/** 兜底额度字段的收敛：不是数字就当未知（null），避免 NaN 漏到界面。 */
+function normalizeFallback(prev) {
+  const v = quotaCount(prev && prev.fallbackRemaining);
+  return v === null ? null : Math.max(0, v);
 }
 
 /**
@@ -308,16 +319,18 @@ function describeFeedbackResult(r) {
   }
 
   if (status === 429) {
-    // kind 是 Worker 给的：burst = 10 分钟窗口撞了，daily = 今天真没了。
-    // 分不清就按 daily 说——让人等十分钟比让人白等一天更糟。
+    // kind 由 Worker 给出：
+    //   burst    = 兜底池的 10 分钟窗口撞了（本插件仍在 48h 冷却里）
+    //   cooldown = 本插件 48h 冷却中，且兜底池也空了
+    // 分不清按 cooldown 说——让人等十分钟比让人白等一天更糟。
     const burst = data && data.kind === "burst";
     return {
       ok: false,
       kind: "rate_limited",
       message: burst
         ? "发得太快了，稍等几分钟再试，或改用 GitHub Issue 反馈"
-        : "今天的反馈额度已用完，明天再来，或改用 GitHub Issue 反馈",
-      // burst 时今天还有额度，写死 0 会让界面谎报「今天用完了」。
+        : "这个插件每 48 小时只能提交 1 条反馈，可稍后再来，或改用 GitHub Issue 反馈",
+      // burst 时兜底池其实还有剩；剩余额度由服务端回传，没给才写 0。
       remaining: burst ? remaining : 0,
     };
   }
@@ -375,13 +388,16 @@ function describeFeedbackResult(r) {
 /**
  * 额度提示文案。查不到额度时也要给一句话，不能空着。
  *
- * 两种「查不到」要分开：
+ * 额度口径是「本插件每 48 小时 1 条 + 每 IP 每天共享兜底 3 条」，所以
+ * 要区分三种状态：
  *   - `{offline: true}`：请求失败（网络/代理/中转挂了）。说「额度有限」
  *     会把网络故障说成用户在刷屏，把他引到错误的方向。
- *   - 其他：服务端回了但字段脏，或压根没查。这时该提醒别刷屏。
+ *   - remaining=1：本插件现在能发。
+ *   - remaining=0：本插件在 48 小时冷却里；若 fallbackRemaining>0，仍可
+ *     借共享兜底发出去，文案要说清，别让用户以为彻底没戏。
  *
- * @param {{remaining?: number, dailyLimit?: number, offline?: boolean}|null} quota
- * @returns {{remaining: number|null, message: string}}
+ * @param {{remaining?: number, dailyLimit?: number, fallbackRemaining?: number, offline?: boolean}|null} quota
+ * @returns {{remaining: number|null, message: string, canRetry?: boolean}}
  */
 function describeQuota(quota) {
   if (quota && quota.offline) {
@@ -394,10 +410,18 @@ function describeQuota(quota) {
     return { remaining: null, message: "额度有限，请勿刷屏", canRetry: true };
   }
   const remaining = Math.max(0, raw);
-  if (remaining === 0) {
-    return { remaining: 0, message: "今天的反馈额度已用完，明天再来", canRetry: true };
+  const fallback = quotaCount(quota ? quota.fallbackRemaining : undefined);
+  if (remaining > 0) {
+    return { remaining, message: "每个插件每两天可提交 1 条反馈", canRetry: false };
   }
-  return { remaining, message: "今天还可发 " + remaining + " 条反馈", canRetry: false };
+  if (fallback !== null && fallback > 0) {
+    return {
+      remaining: 0,
+      message: "本插件额度已用，仍可借共享额度再发 " + fallback + " 条",
+      canRetry: false,
+    };
+  }
+  return { remaining: 0, message: "本插件的反馈额度已用完，48 小时后再来", canRetry: true };
 }
 
 // ---- src/lib/feedback-net.mjs ----
@@ -505,18 +529,20 @@ function createFeedbackNet(ctx, opts) {
   }
 
   /**
-   * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住
+   * 查本插件当前的额度。失败时返回 `{offline: true}`——额度查不到不能挡住
    * 发反馈，但要让界面知道「是连不上」而不是「额度紧张」，两句话说给用户
    * 听的意思完全不同。
    *
-   * @returns {Promise<{remaining: number, dailyLimit: number}|{offline: true}|null>}
+   * 必须带 `?pluginId=`：冷却按插件区分，不带的话服务端只能回乐观值。
+   *
+   * @returns {Promise<{remaining: number, dailyLimit: number, fallbackRemaining?: number}|{offline: true}|null>}
    */
   async function quota() {
     try {
       const res = await fbNetTimeout(
         ctx.bridge.invoke("plugin_http_request", {
           method: "GET",
-          url: endpoint + "/quota",
+          url: endpoint + "/quota?pluginId=" + encodeURIComponent(pluginId),
           headers: { "User-Agent": userAgent() },
           body: null,
         }),
@@ -530,9 +556,13 @@ function createFeedbackNet(ctx, opts) {
       // 与「请求失败」同样按连不上处理——不需要单独再判一次。
       const data = body ? JSON.parse(body) : null;
       // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/"" 读成 0，
-      // 界面会说「今天的额度已用完」。
+      // 界面会说「额度已用完」。
       const remaining = data ? quotaCount(data.remaining) : null;
-      return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
+      if (remaining === null) return null;
+      const fallback = data ? quotaCount(data.fallbackRemaining) : null;
+      const out = { remaining, dailyLimit: Number(data.dailyLimit) || 1 };
+      if (fallback !== null) out.fallbackRemaining = Math.max(0, fallback);
+      return out;
     } catch {
       return { offline: true };
     }

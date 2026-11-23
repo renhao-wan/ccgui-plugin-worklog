@@ -1,7 +1,7 @@
 {
   "id": "worklog",
   "name": "工作志",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "sdkVersion": "^0.3.25",
   "minAppVersion": "1.2.4",
   "author": "renhao-wan",
@@ -9,7 +9,15 @@
   "repo": "renhao-wan/ccgui-plugin-worklog",
   "license": "MIT",
   "icon": "docs/icon.png",
-  "keywords": ["worklog", "journal", "daily", "report", "retro", "claude", "review"],
+  "keywords": [
+    "worklog",
+    "journal",
+    "daily",
+    "report",
+    "retro",
+    "claude",
+    "review"
+  ],
   "tier": "js",
   "permissions": [
     "ui:center-tab",

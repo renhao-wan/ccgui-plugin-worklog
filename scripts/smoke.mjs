@@ -1835,11 +1835,13 @@ function findLink(tree, text) {
   return hit;
 }
 
-const okQuota = () => ({ status: 200, body: JSON.stringify({ remaining: 25, dailyLimit: 30 }) });
+const okQuota = () => ({ status: 200, body: JSON.stringify({ remaining: 1, dailyLimit: 1, fallbackRemaining: 3 }) });
+// 发送成功后本插件即进入 48h 冷却（remaining:0），兜底池少一条。
+const okSend = () => ({ status: 200, body: JSON.stringify({ ok: true, remaining: 0, dailyLimit: 1, fallbackRemaining: 2 }) });
 
 await (async () => {
   const tree = await mountFeedback((args) =>
-    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: JSON.stringify({ ok: true, remaining: 24 }) },
+    args.url.includes("/quota") ? okQuota() : okSend(),
   );
 
   check("反馈：两种渠道都在，且请求体只有白名单字段", () => {
@@ -1852,13 +1854,13 @@ await (async () => {
     assert.match(link.props.href, /title=%5B%E5%8F%8D%E9%A6%88%5D/, "标题应预填并编码");
 
     // 挂载时查过一次额度
-    const quotaCall = httpCalls.find((c) => String(c.url).endsWith("/quota"));
+    const quotaCall = httpCalls.find((c) => String(c.url).includes("/quota"));
     assert.ok(quotaCall, "挂载时应查一次额度");
     assert.equal(httpCalls.length, 1, "挂载时只该查额度，不该发反馈");
   });
 
   check("反馈：额度文案用服务端回传的真实值", () => {
-    assert.match(textOf(byClass(tree, "wl-feedback-quota")), /25/);
+    assert.match(textOf(byClass(tree, "wl-feedback-quota")), /两天|48/);
   });
 
   const filled = await (async () => {
@@ -1895,10 +1897,10 @@ await (async () => {
     assert.match(String(posts[0].headers["User-Agent"]), /^ccgui-worklog\//);
   });
 
-  check("反馈：成功后清空正文、按钮回到可用态且额度用回传值", () => {
+  check("反馈：成功后清空正文、按钮回到可用态且额度反映冷却状态", () => {
     assert.equal(byClass(sentTree, "wl-feedback-text").props.value, "");
     assert.match(textOf(byClass(sentTree, "wl-feedback-send")), /已发送/);
-    assert.match(textOf(byClass(sentTree, "wl-feedback-quota")), /24/);
+    assert.match(textOf(byClass(sentTree, "wl-feedback-quota")), /共享|48|两天/);
     assert.match(textOf(byClass(sentTree, "wl-feedback-status")), /已发送/);
   });
 })();
@@ -1906,7 +1908,7 @@ await (async () => {
 await (async () => {
   // 额度查不到（500），但发送成功并回传 remaining
   const tree = await mountFeedback((args) =>
-    args.url.endsWith("/quota") ? { status: 500, body: "boom" } : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) },
+    args.url.includes("/quota") ? { status: 500, body: "boom" } : okSend(),
   );
 
   check("反馈：额度查不到时说明是连不上，并给重试入口", () => {
@@ -1915,34 +1917,32 @@ await (async () => {
   });
 
   // 重试按钮真的会再查一次
-  httpResponder = (args) =>
-    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) };
-  const before = httpCalls.filter((c) => String(c.url).endsWith("/quota")).length;
+  httpResponder = (args) => (args.url.includes("/quota") ? okQuota() : okSend());
+  const before = httpCalls.filter((c) => String(c.url).includes("/quota")).length;
   byClass(renderKeep(settingsDef.component), "wl-feedback-quota-retry").props.onClick();
   await sleep(120);
   const retried = renderKeep(settingsDef.component);
   check("反馈：重试按钮会重新查额度，查到后收起重试入口", () => {
-    assert.equal(httpCalls.filter((c) => String(c.url).endsWith("/quota")).length, before + 1);
-    assert.match(textOf(byClass(retried, "wl-feedback-quota")), /25/);
+    assert.equal(httpCalls.filter((c) => String(c.url).includes("/quota")).length, before + 1);
+    assert.match(textOf(byClass(retried, "wl-feedback-quota")), /两天|48/);
     assert.equal(byClass(retried, "wl-feedback-quota-retry"), null, "有额度时不该再挂重试按钮");
   });
 
   // 再挂一次「查不到」，验证发送成功会顺手纠正额度区
-  httpResponder = (args) =>
-    args.url.endsWith("/quota") ? { status: 500, body: "boom" } : { status: 200, body: JSON.stringify({ ok: true, remaining: 23 }) };
+  httpResponder = (args) => (args.url.includes("/quota") ? { status: 500, body: "boom" } : okSend());
   byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "一条反馈" } });
   byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
   await sleep(120);
   const after = renderKeep(settingsDef.component);
   check("反馈：额度查不到但发送成功，额度区不再停留在「连不上」", () => {
-    assert.match(textOf(byClass(after, "wl-feedback-quota")), /23/);
+    assert.match(textOf(byClass(after, "wl-feedback-quota")), /共享|48|两天/);
     assert.doesNotMatch(textOf(byClass(after, "wl-feedback-quota")), /连不上/);
   });
 })();
 
 await (async () => {
   await mountFeedback((args) =>
-    args.url.endsWith("/quota") ? okQuota() : { status: 200, body: "<html>请登录校园网</html>" },
+    args.url.includes("/quota") ? okQuota() : { status: 200, body: "<html>请登录校园网</html>" },
   );
   byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "被劫持" } });
   byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
@@ -1957,7 +1957,7 @@ await (async () => {
 
 await (async () => {
   await mountFeedback((args) => {
-    if (args.url.endsWith("/quota")) return okQuota();
+    if (args.url.includes("/quota")) return okQuota();
     throw new Error("net::ERR_NAME_NOT_RESOLVED");
   });
   byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "断网" } });
@@ -1973,18 +1973,18 @@ await (async () => {
 
 await (async () => {
   await mountFeedback((args) => {
-    if (args.url.endsWith("/quota")) return okQuota();
+    if (args.url.includes("/quota")) return okQuota();
     return { status: 429, body: JSON.stringify({ ok: false, error: "rate_limited", kind: "burst", remaining: 25 }) };
   });
   byClass(renderKeep(settingsDef.component), "wl-feedback-text").props.onChange({ target: { value: "发太快" } });
   byClass(renderKeep(settingsDef.component), "wl-feedback-send").props.onClick();
   await sleep(120);
   const t = renderKeep(settingsDef.component);
-  check("反馈：突发限流说「稍等几分钟」，不谎报今天用完", () => {
+  check("反馈：突发限流说「稍等几分钟」，不谎报额度耗尽", () => {
     const s = textOf(byClass(t, "wl-feedback-status"));
     assert.match(s, /太快|稍候|分钟/);
-    assert.doesNotMatch(s, /明天/);
-    assert.match(textOf(byClass(t, "wl-feedback-quota")), /25/);
+    assert.doesNotMatch(s, /48|两天/);
+    assert.match(textOf(byClass(t, "wl-feedback-quota")), /共享|48|两天/);
   });
 })();
 

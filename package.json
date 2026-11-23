@@ -1,6 +1,6 @@
 {
   "name": "ccgui-plugin-worklog",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "工作志：把每天的会话与代码改动整理成可核对的工作日志",
@@ -17,6 +17,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.1"
+    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.2"
   }
 }
