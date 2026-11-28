@@ -267,6 +267,7 @@ html.dark .wl-dd-menu, .dark .wl-dd-menu { box-shadow:0 8px 24px rgba(0,0,0,.45)
 .wl-dd-label { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wl-dd-check { flex:none; font-size:12px; color:var(--wl-accent); opacity:0; }
 .wl-dd-item[aria-selected="true"] .wl-dd-check { opacity:1; }
+.wl-dd-group { padding:6px 10px 2px; font-size:11px; color:var(--wl-muted); user-select:none; }
 .wl-dd-empty { padding:8px 10px; font-size:12px; color:var(--wl-muted); }
 
 .wl-seg { display:inline-flex; padding:2px; gap:2px; border-radius:var(--wl-r-ctl); background:var(--wl-raised); border:1px solid var(--wl-border); }
@@ -4513,166 +4514,13 @@ function CenterTab() {
 }
 
 /**
- * 自绘下拉：按钮 + 列表，替代原生 select。
- * 原生 select 的展开层由系统绘制，宿主 WebView 里不跟随主题，字号与输入框也对不上。
- * items: [{ value, label, disabled? }]；value 用字符串比较，空字符串表示「自动」。
+ * 自绘下拉。实现在共用包 `ccgui-plugin-shared/dropdown`，构建期内联到本文件。
+ *
+ * 原来这里有一份 156 行的本地实现，键盘分两层挂（trigger 一组、菜单一组）：
+ * 菜单一打开焦点就移到选项上，trigger 的 handler 再也收不到事件，那段
+ * `onTriggerKeyDown` 实际只剩「打开菜单」一个作用。共用库统一挂在容器上。
  */
-function Dropdown(props) {
-  const R = appCtx.react;
-  const openState = R.useState(false);
-  const open = openState[0];
-  const setOpen = openState[1];
-  const focusState = R.useState(-1);
-  const focusIdx = focusState[0];
-  const setFocusIdx = focusState[1];
-  // 触发器下方空间不够时改为向上弹，避免菜单被视口底部裁掉
-  const upState = R.useState(false);
-  const up = upState[0];
-  const setUp = upState[1];
-  const triggerRef = R.useRef(null);
-  const itemRefs = R.useRef([]);
-
-  const items = props.items || [];
-  // value 既是按钮上显示的内容，也是「真正生效的那个」：两者不再分开。
-  // 空字符串表示未选中，显示 placeholder。
-  const value = props.value == null ? "" : String(props.value);
-  const selectedIdx = items.findIndex((it) => String(it.value) === value);
-  const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
-  const placeholder = props.placeholder || "请选择";
-
-  R.useEffect(() => {
-    if (!open) return;
-    const el = itemRefs.current[focusIdx];
-    if (el && typeof el.focus === "function") el.focus();
-  }, [open, focusIdx]);
-
-  const openMenu = () => {
-    if (props.disabled) return;
-    let i = selectedIdx;
-    if (i < 0) i = items.findIndex((it) => !it.disabled);
-    setFocusIdx(i < 0 ? 0 : i);
-    // 估算菜单高度：不超过 260，也不超过内容高度
-    const est = Math.min(260, items.length * 32 + 8);
-    const el = triggerRef.current;
-    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
-      const rect = el.getBoundingClientRect();
-      const below = (window.innerHeight || 800) - rect.bottom;
-      setUp(below < est + 12 && rect.top > below);
-    }
-    setOpen(true);
-  };
-
-  const choose = (item) => {
-    if (!item || item.disabled) return;
-    setOpen(false);
-    if (String(item.value) !== value) props.onChange(item.value);
-  };
-
-  const move = (step) => {
-    if (!items.length) return;
-    let i = focusIdx;
-    for (let n = 0; n < items.length; n++) {
-      i = (i + step + items.length) % items.length;
-      if (!items[i].disabled) break;
-    }
-    setFocusIdx(i);
-  };
-
-  const onTriggerKeyDown = (ev) => {
-    if (props.disabled) return;
-    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      if (!open) openMenu();
-      else move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      if (open) choose(items[focusIdx]);
-      else openMenu();
-    } else if (ev.key === "Escape" && open) {
-      ev.preventDefault();
-      setOpen(false);
-    }
-  };
-
-  // 焦点会被移到选项 div 上（见上面的 useEffect），此后 trigger 的
-  // onKeyDown 收不到事件：键盘操作必须在菜单上再接一层，
-  // 否则方向键、回车、Esc 在选项上全部失效。
-  const onMenuKeyDown = (ev) => {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      setOpen(false);
-      const el = triggerRef.current;
-      if (el && typeof el.focus === "function") el.focus();
-    } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      choose(items[focusIdx]);
-    } else if (ev.key === "Tab") {
-      // Tab 离开就收起，别把展开的菜单留在身后
-      setOpen(false);
-    }
-  };
-
-  return h(
-    "div",
-    { className: "wl-dd" + (open ? " is-open" : "") + (up ? " is-up" : "") },
-    h(
-      "button",
-      {
-        type: "button",
-        className: "wl-dd-trigger",
-        ref: triggerRef,
-        disabled: props.disabled,
-        "aria-haspopup": "listbox",
-        "aria-expanded": open,
-        onClick: () => (open ? setOpen(false) : openMenu()),
-        onKeyDown: onTriggerKeyDown,
-      },
-      h(
-        "span",
-        { className: "wl-dd-value" + (selected ? "" : " is-empty") },
-        selected ? selected.label : placeholder
-      ),
-      h("span", { className: "wl-dd-caret", "aria-hidden": "true" })
-    ),
-    open ? h("div", { className: "wl-dd-scrim", onClick: () => setOpen(false) }) : null,
-    open
-      ? h(
-          "div",
-          { className: "wl-dd-menu", role: "listbox", onKeyDown: onMenuKeyDown },
-          items.length
-            ? items.map((item, i) =>
-                h(
-                  "div",
-                  {
-                    key: String(item.value) + ":" + i,
-                    ref: (el) => {
-                      itemRefs.current[i] = el;
-                    },
-                    className:
-                      "wl-dd-item" +
-                      (i === focusIdx ? " is-active" : "") +
-                      (item.disabled ? " is-disabled" : ""),
-                    role: "option",
-                    "aria-selected": String(item.value) === value,
-                    "aria-disabled": item.disabled ? true : undefined,
-                    tabIndex: -1,
-                    onClick: () => choose(item),
-                    onMouseEnter: () => {
-                      if (!item.disabled) setFocusIdx(i);
-                    },
-                  },
-                  h("span", { className: "wl-dd-label" }, item.label),
-                  h("span", { className: "wl-dd-check", "aria-hidden": "true" }, "✓")
-                )
-              )
-            : h("div", { className: "wl-dd-empty" }, props.emptyText || "没有可选项")
-        )
-      : null
-  );
-}
+const Dropdown = createDropdown(() => appCtx.react, { prefix: "wl" });
 
 function EnvRow(props) {
   const item = props.item;

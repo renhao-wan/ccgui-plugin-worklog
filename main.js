@@ -118,8 +118,8 @@ function sortEngines(list) {
 
 const SCAN_SOURCE = "#!/usr/bin/env node\n/**\n * 工作志扫描器：只读解析本机 CLI 会话日志，输出指定日期的事实快照。\n *\n * 设计约束：\n * - 零依赖，只使用 node 内置模块\n * - 绝不写入源会话文件\n * - 只输出结构化事实，不做任何 AI 推演\n *\n * 用法：\n *   node scan.mjs --root <会话根目录> --date YYYY-MM-DD [--out <结果文件>]\n *   node scan.mjs --root <dir> --from YYYY-MM-DD --to YYYY-MM-DD\n *\n * 输出：默认 stdout 一段 JSON；给 --out 时写入该文件，stdout 只回一行摘要。\n * 错误走 stderr 并以非零退出。\n */\n\nimport fs from \"node:fs\";\nimport os from \"node:os\";\nimport path from \"node:path\";\n\nconst MAX_USER_MESSAGES_PER_SESSION = 80;\nconst MAX_USER_TEXT = 800;\nconst MAX_SUMMARY_TEXT = 1500;\nconst MAX_COMMAND_TEXT = 300;\nconst MAX_COMMANDS_PER_SESSION = 60;\nconst MAX_TOOL_ERRORS_PER_SESSION = 50;\n// 每轮「用户要求 → 助手首条回应」保留最近 N 对，供报告判断实际进展\nconst MAX_TURNS_PER_SESSION = 40;\nconst MAX_TURN_USER_TEXT = 500;\nconst MAX_TURN_REPLY_TEXT = 300;\n// 用户连续发言、助手还没回应时先排队的上限\nconst MAX_PENDING_TURNS = 5;\n// 资源上限：会话日志可能被巨型附件撑到几百 MB。超限的文件与单行直接跳过，\n// 并在 failures 里说明，免得整次扫描被一个坏文件拖垮。\nconst MAX_SESSION_FILE_MB = 512;\nconst MAX_FILES_PER_SCAN = 4000;\nconst MAX_LINE_CHARS = 32 * 1024 * 1024;\n\n/** 内部注入的消息特征：这些不是用户真正输入的内容。\n *  只列已知标签，不用裸 \"<\" 兜底——用户会粘贴 HTML/XML/JSX，\n *  那种消息是真实需求，不能吞掉。 */\nconst INTERNAL_PREFIXES = [\n  \"<task-notification\",\n  \"<fork-boilerplate\",\n  \"<command-message\",\n  \"<command-name>\",\n  \"<command-args>\",\n  \"<local-command-stdout>\",\n  \"<local-command-stderr>\",\n  \"<local-command-caveat>\",\n  \"<system-reminder>\",\n  \"<user-prompt-submit-hook>\",\n  \"<bash-input>\",\n  \"<bash-stdout>\",\n  \"<bash-stderr>\",\n  \"<ide_opened_file>\",\n  \"<ide_selection>\",\n  \"Base directory for this skill:\",\n  \"[CCGUI internal\",\n  \"Caveat: The messages below were generated\",\n  \"This is a resumed session\",\n  \"This session is being continued\",\n  \"This conversation has been compacted\",\n  \"[Request interrupted\",\n];\n\nfunction isInternalText(text) {\n  const t = text.trim();\n  if (!t) return true;\n  return INTERNAL_PREFIXES.some((p) => t.startsWith(p));\n}\n\n/**\n * 插件自己生成报告时留下的会话。\n *\n * 宿主执行 agent 会把这一轮也写进会话日志，cwd 正是「引擎运行目录」。\n * 不排除的话，写日报这件事本身会变成一条「工作产出」：\n * 生成日报 → 会话里多一条「写日报」→ 下次报告把它写进去 → 越滚越多。\n * 只认我们自己写死的提示词开头，用户真的要求「写日报」不会被误伤。\n */\nconst GENERATION_PROMPT_PREFIXES = [\n  \"你是一位替工程师写工作日报的助手。\",\n  \"你是一位帮工程师做当日复盘的教练。\",\n  \"你是一位替工程师写周报的助手。\",\n  \"你是一位替工程师写工作记录的助手。\",\n];\n\n/** 这一整行是否是「插件自己在跑生成」的那一刻。 */\nfunction isGenerationPrompt(text) {\n  const t = String(text || \"\").trim();\n  if (!t) return false;\n  return GENERATION_PROMPT_PREFIXES.some((p) => t.startsWith(p));\n}\n\nfunction parseArgs(argv) {\n  const out = {};\n  for (let i = 0; i < argv.length; i++) {\n    const a = argv[i];\n    if (!a.startsWith(\"--\")) continue;\n    const key = a.slice(2);\n    const val = argv[i + 1] && !argv[i + 1].startsWith(\"--\") ? argv[++i] : \"true\";\n    out[key] = val;\n  }\n  return out;\n}\n\nfunction localDayStart(dateStr) {\n  // dateStr 按本机本地时区解释为当天 00:00；不使用 Date.parse 的 UTC 语义\n  const m = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(dateStr);\n  if (!m) throw new Error(\"日期格式应为 YYYY-MM-DD：\" + dateStr);\n  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0).getTime();\n}\n\nfunction dayKey(tsMs) {\n  const d = new Date(tsMs);\n  const p = (n) => String(n).padStart(2, \"0\");\n  return d.getFullYear() + \"-\" + p(d.getMonth() + 1) + \"-\" + p(d.getDate());\n}\n\nfunction hourKey(tsMs) {\n  return String(new Date(tsMs).getHours()).padStart(2, \"0\");\n}\n\nfunction collectFiles(dir, sinceMs, out) {\n  let entries;\n  try {\n    entries = fs.readdirSync(dir, { withFileTypes: true });\n  } catch {\n    return out;\n  }\n  for (const e of entries) {\n    if (out.length >= MAX_FILES_PER_SCAN) return out;\n    const p = path.join(dir, e.name);\n    if (e.isDirectory()) {\n      collectFiles(p, sinceMs, out);\n    } else if (e.name.endsWith(\".jsonl\")) {\n      let st;\n      try {\n        st = fs.statSync(p);\n      } catch {\n        continue;\n      }\n      // 通常 mtime 早于起始日的文件不含当天消息，跳过它省时间。\n      // 复制、恢复备份或时钟漂移会打破这个假设，所以这只是优化，不是正确性保证。\n      if (st.mtimeMs >= sinceMs) out.push({ p, mtimeMs: st.mtimeMs, size: st.size });\n    }\n  }\n  return out;\n}\n\n/** 从消息内容数组里提取纯文本；tool_result / image 等不算。 */\nfunction textBlocks(content) {\n  if (!Array.isArray(content)) return [];\n  return content\n    .filter((b) => b && b.type === \"text\" && typeof b.text === \"string\")\n    .map((b) => b.text);\n}\n\nfunction isToolResult(content) {\n  return Array.isArray(content) && content.some((b) => b && b.type === \"tool_result\");\n}\n\n/** message.content 可能是块数组、纯字符串或缺失；统一成数组，缺失返回 null。 */\nfunction messageContent(msg) {\n  if (!msg) return null;\n  const c = msg.content;\n  if (typeof c === \"string\") return c.trim() ? [{ type: \"text\", text: c }] : [];\n  if (Array.isArray(c)) return c;\n  return null;\n}\n\n/** 截断，保留首尾；避免把大段附件写进结果。 */\nfunction clip(text, max) {\n  if (text.length <= max) return text;\n  const head = Math.floor(max * 0.7);\n  const tail = max - head - 3;\n  return text.slice(0, head) + \"…\" + text.slice(-tail);\n}\n\n/* ------------------------------------------------------------ 引擎适配器\n * 扫描器只认识一种会话日志格式：Claude Code 的 JSONL。其它引擎（Codex、\n * Qoder、Kimi…）的字段名与目录布局都不同，没有真实样本前不臆造解析。\n * 这里把「读一行原始对象 → 规范字段」集中成适配器，后续接入新引擎时\n * 只需要新增一个条目，扫描主流程不用改。\n */\nconst ADAPTERS = {\n  claude: {\n    id: \"claude\",\n    label: \"Claude Code\",\n    /** 规范形状：{ ts, sessionId, workspace, branch, cliVersion, sidechain, kind, content } */\n    readLine(o) {\n      if (!o || typeof o !== \"object\") return null;\n      const kind = o.type === \"user\" || o.type === \"assistant\" ? o.type : \"\";\n      return {\n        ts: typeof o.timestamp === \"string\" ? o.timestamp : null,\n        sessionId: o.sessionId ? String(o.sessionId) : null,\n        workspace: o.cwd ? String(o.cwd) : \"\",\n        branch: o.gitBranch ? String(o.gitBranch) : null,\n        cliVersion: o.version ? String(o.version) : null,\n        sidechain: o.isSidechain === true,\n        kind: kind,\n        content: messageContent(o.message),\n      };\n    },\n  },\n};\n\nfunction resolveAdapter(name) {\n  const key = String(name || \"\").trim().toLowerCase();\n  if (!key || key === \"auto\") return ADAPTERS.claude;\n  // 只认 ADAPTERS 的自有属性：constructor / __proto__ 之类会命中原型链，\n  // 拿到一个没有 readLine 的对象，最后变成「扫描成功但 0 个会话」。\n  return Object.prototype.hasOwnProperty.call(ADAPTERS, key) ? ADAPTERS[key] : null;\n}\n\n/** 按行读文件，单行超长时跳过但继续。\n *\n *  readline 遇到超长行会把整行缓存在内存里：一条几 GB 的附件行足以把扫描\n *  进程撑爆。这里自己切分，跳过期间也不保留数据，内存只与 chunk 大小有关。 */\nasync function* readLinesBounded(filePath, maxLine) {\n  const stream = fs.createReadStream(filePath, { encoding: \"utf8\", highWaterMark: 1 << 16 });\n  let buf = \"\";\n  let skipping = false;\n  for await (const chunk of stream) {\n    if (skipping) {\n      const nl = chunk.indexOf(\"\\n\");\n      if (nl < 0) continue; // 这一块仍然属于被丢弃的那行\n      skipping = false;\n      buf = chunk.slice(nl + 1);\n    } else {\n      buf += chunk;\n    }\n    let idx;\n    while ((idx = buf.indexOf(\"\\n\")) >= 0) {\n      const line = buf.slice(0, idx);\n      buf = buf.slice(idx + 1);\n      if (line.length <= maxLine) yield line;\n    }\n    if (buf.length > maxLine) {\n      // 还没有换行就已经超长：丢弃这一行剩余部分\n      buf = \"\";\n      skipping = true;\n    }\n  }\n  if (!skipping && buf && buf.length <= maxLine) yield buf;\n}\n\nasync function scanSessionFile(file, windowStart, windowEnd, adapter) {\n  if (file.size > MAX_SESSION_FILE_MB * 1048576) {\n    throw new Error(\"会话文件 \" + path.basename(file.p) + \" 超过 \" + MAX_SESSION_FILE_MB + \"MB，已跳过\");\n  }\n\n  const s = {\n    sessionId: null,\n    engine: adapter.id,\n    workspace: \"\",\n    gitBranch: null,\n    cliVersion: null,\n    sourceFile: path.basename(file.p),\n    sourceSizeMB: Number((file.size / 1048576).toFixed(2)),\n    continuedFromEarlierDay: false,\n    firstSeenAt: null,\n    lastSeenAt: null,\n    userTurns: 0,\n    assistantTurns: 0,\n    thinkingTurns: 0,\n    userMessages: [],\n    turns: [],\n    finalAssistantText: \"\",\n    // 工具名来自 JSONL，是外部输入：普通对象上 \"constructor\"/\"__proto__\"\n    // 会命中原型链或被静默忽略，计数变字符串或直接丢失。\n    tools: Object.create(null),\n    toolErrors: [],\n    editedFiles: new Set(),\n    fileEditCounts: Object.create(null),\n    commands: [],\n    hours: Object.create(null),\n    sidechainTurns: 0,\n  };\n\n  let sawAnyMessageBeforeWindow = false;\n  let sawAnyMessageInWindow = false;\n  // 这个文件是不是插件自己生成报告留下的：只有「整份会话的第一条真实用户消息\n  // 就是我们的提示词」才算。用户只是把提示词粘进真实会话里讨论时，那一行按\n  // 内部注入跳过，不能把整份会话一起丢掉。\n  let isSelfGenerated = false;\n  let sawAnyRealUserMessage = false;\n  // 当前等待助手回应的用户轮次（可能连续多条），用于把「要求」和「怎么回应」配对\n  let pendingTurns = [];\n  // 窗口之前最后一条真实用户消息：当天助手首次回应时用它配对，避免跨天丢失\n  let carryTurn = null;\n\n  for await (const line of readLinesBounded(file.p, MAX_LINE_CHARS)) {\n    if (!line || line.length < 2) continue;\n    let o;\n    try {\n      o = JSON.parse(line);\n    } catch {\n      continue; // 残缺尾部或非 JSON 行：忽略，不伪造事件\n    }\n\n    const rec = adapter.readLine(o);\n    if (!rec) continue;\n    if (rec.sessionId && !s.sessionId) s.sessionId = rec.sessionId;\n    if (rec.workspace && !s.workspace) s.workspace = rec.workspace;\n    if (rec.branch && !s.gitBranch) s.gitBranch = rec.branch;\n    if (rec.cliVersion && !s.cliVersion) s.cliVersion = rec.cliVersion;\n\n    const tsRaw = rec.ts;\n    const ts = typeof tsRaw === \"string\" ? Date.parse(tsRaw) : NaN;\n    if (!Number.isFinite(ts)) continue;\n\n    if (ts < windowStart) {\n      sawAnyMessageBeforeWindow = true;\n      // 窗口之前最后一条真实用户消息：留给当天助手首次回应配对\n      if (rec.kind === \"user\" && !rec.sidechain) {\n        const early = rec.content;\n        if (early && !isToolResult(early)) {\n          const text = textBlocks(early).join(\"\\n\").trim();\n          if (text && !isInternalText(text)) {\n            // 窗口之前就有过真实用户消息：这份文件不是插件自己生成报告留下的\n            if (!isGenerationPrompt(text)) sawAnyRealUserMessage = true;\n            carryTurn = {\n              ts: tsRaw,\n              user: clip(text, MAX_TURN_USER_TEXT),\n              fromEarlierDay: true,\n            };\n          }\n        }\n      }\n      continue;\n    }\n    if (ts >= windowEnd) continue;\n\n    // content 可能是块数组，也可能是字符串：CLI 的内部注入、\n    // 部分续接消息与简单用户输入都会以纯字符串落盘。\n    const content = rec.content;\n    if (content === null) continue;\n\n    if (rec.sidechain) {\n      s.sidechainTurns++;\n      continue;\n    }\n\n    if (rec.kind === \"user\") {\n\n      // 工具错误：tool_result 块上的 is_error\n      for (const b of content) {\n        if (b && b.type === \"tool_result\" && b.is_error) {\n          const raw = Array.isArray(b.content)\n            ? b.content.filter((x) => x && x.type === \"text\").map((x) => x.text).join(\"\\n\")\n            : typeof b.content === \"string\"\n              ? b.content\n              : \"\";\n          s.toolErrors.push({ ts: tsRaw, text: clip(String(raw || \"\"), 300) });\n          // 报错只保留最近的，避免单个会话几百条错误撑大快照\n          if (s.toolErrors.length > MAX_TOOL_ERRORS_PER_SESSION) s.toolErrors.shift();\n        }\n      }\n\n      if (isToolResult(content)) continue; // 工具回包不算用户轮次\n\n      const joined = textBlocks(content).join(\"\\n\").trim();\n      if (!joined || isInternalText(joined)) continue;\n\n      // 这一行是插件自己在生成报告：只有「整份会话的第一条真实用户消息就是\n      // 我们的提示词」才认定整份丢弃。用户把提示词粘进自己的会话里讨论时，\n      // 那只是其中一条消息，跳过它就好，不能把当天的真实工作一起吞掉。\n      if (isGenerationPrompt(joined)) {\n        if (!sawAnyRealUserMessage) {\n          isSelfGenerated = true;\n          break;\n        }\n        continue;\n      }\n      sawAnyRealUserMessage = true;\n\n      sawAnyMessageInWindow = true;\n      s.userTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n      // 保留最近的 N 条：报告关心的是会话最后在做什么\n      s.userMessages.push({ ts: tsRaw, text: clip(joined, MAX_USER_TEXT) });\n      if (s.userMessages.length > MAX_USER_MESSAGES_PER_SESSION) s.userMessages.shift();\n      pendingTurns.push({ ts: tsRaw, user: clip(joined, MAX_TURN_USER_TEXT) });\n      if (pendingTurns.length > MAX_PENDING_TURNS) pendingTurns.shift();\n      // 用户已经继续对话，之前窗口外的要求不再等待配对\n      carryTurn = null;\n      continue;\n    }\n\n    if (rec.kind === \"assistant\") {\n      sawAnyMessageInWindow = true;\n      s.assistantTurns++;\n      if (s.firstSeenAt === null) s.firstSeenAt = tsRaw;\n      s.lastSeenAt = tsRaw;\n      s.hours[hourKey(ts)] = (s.hours[hourKey(ts)] || 0) + 1;\n\n      let replyText = \"\";\n      for (const b of content) {\n        if (!b) continue;\n        if (b.type === \"thinking\") s.thinkingTurns++;\n        if (b.type === \"tool_use\") {\n          const name = b.name || \"unknown\";\n          s.tools[name] = (s.tools[name] || 0) + 1;\n          const input = b.input || {};\n          const fp = input.file_path || input.path || input.notebook_path;\n          if (fp && /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(name)) {\n            const key = String(fp);\n            s.editedFiles.add(key);\n            s.fileEditCounts[key] = (s.fileEditCounts[key] || 0) + 1;\n          }\n          if (name === \"Bash\" && typeof input.command === \"string\") {\n            // 同样保留最近的命令\n            s.commands.push({ ts: tsRaw, command: clip(input.command, MAX_COMMAND_TEXT) });\n            if (s.commands.length > MAX_COMMANDS_PER_SESSION) s.commands.shift();\n          }\n        }\n        if (b.type === \"text\" && typeof b.text === \"string\" && b.text.trim()) {\n          s.finalAssistantText = b.text.trim();\n          if (!replyText) replyText = b.text.trim();\n        }\n      }\n      // 把这一轮助手的第一条文字挂到待回应的用户消息上。\n      // 用户连续发了几条就合并成一个要求，不要只留最后一条。\n      if (replyText) {\n        let turn = null;\n        if (pendingTurns.length) {\n          turn = {\n            ts: pendingTurns[pendingTurns.length - 1].ts,\n            user: clip(pendingTurns.map((t) => t.user).join(\" / \"), MAX_TURN_USER_TEXT),\n            fromEarlierDay: false,\n          };\n          pendingTurns = [];\n        } else if (carryTurn) {\n          // 跨天：前一天的用户要求，当天才得到第一次回应\n          turn = carryTurn;\n          carryTurn = null;\n        }\n        if (turn) {\n          s.turns.push({\n            ts: turn.ts,\n            user: turn.user,\n            reply: clip(replyText, MAX_TURN_REPLY_TEXT),\n            fromEarlierDay: turn.fromEarlierDay === true,\n          });\n          if (s.turns.length > MAX_TURNS_PER_SESSION) s.turns.shift();\n        }\n      }\n    }\n  }\n\n  if (!s.sessionId) {\n    // 没有会话 ID 的文件无法追溯，不纳入结果\n    return null;\n  }\n  if (isSelfGenerated) return null;\n  if (!sawAnyMessageInWindow) return null;\n\n  s.continuedFromEarlierDay = sawAnyMessageBeforeWindow;\n  s.editedFiles = [...s.editedFiles];\n  // 同一文件被改多次是「返工/卡点」的可靠信号\n  s.hotFiles = Object.entries(s.fileEditCounts)\n    .filter(([, n]) => n >= 2)\n    .sort((a, b) => b[1] - a[1])\n    .slice(0, 10)\n    .map(([p, n]) => ({ path: p, edits: n }));\n  delete s.fileEditCounts;\n  s.finalAssistantText = clip(s.finalAssistantText, MAX_SUMMARY_TEXT);\n\n  return s;\n}\n\nfunction groupByWorkspace(sessions) {\n  const map = new Map();\n  for (const s of sessions) {\n    const key = s.workspace || \"(未知工作区)\";\n    if (!map.has(key)) {\n      map.set(key, { workspace: key, sessions: [], editedFiles: new Set(), tools: Object.create(null), userTurns: 0 });\n    }\n    const g = map.get(key);\n    g.sessions.push(s.sessionId);\n    g.userTurns += s.userTurns;\n    for (const f of s.editedFiles) g.editedFiles.add(f);\n    for (const [name, n] of Object.entries(s.tools)) g.tools[name] = (g.tools[name] || 0) + n;\n  }\n  return [...map.values()].map((g) => ({ ...g, editedFiles: [...g.editedFiles] }));\n}\n\nasync function main() {\n  const args = parseArgs(process.argv.slice(2));\n  // 目前只实现 Claude Code 的适配器；显式指定未知引擎时明确失败，\n  // 而不是悄悄按 Claude 的格式解析出一堆空会话。\n  const adapter = resolveAdapter(args.engine);\n  if (!adapter) {\n    throw new Error(\n      \"不支持引擎 \" + args.engine + \"；目前只能解析 Claude Code 的会话日志（--engine claude）\"\n    );\n  }\n  // --root auto（或缺省）= Claude Code 的默认会话目录\n  const root = !args.root || args.root === \"auto\" ? path.join(os.homedir(), \".claude\", \"projects\") : args.root;\n  if (!root) throw new Error(\"缺少 --root <会话根目录>\");\n  // 显式指定的目录不存在时直接报错：返回空结果会被误读成「今天没干活」\n  // （auto 目录不存在是正常的，新机器上还没用过 Claude Code）\n  if (args.root && args.root !== \"auto\" && !fs.existsSync(root)) {\n    throw new Error(\"会话根目录不存在：\" + root);\n  }\n\n  const from = args.from || args.date;\n  const to = args.to || args.date || from;\n  if (!from) throw new Error(\"缺少 --date 或 --from/--to\");\n\n  const windowStart = localDayStart(from);\n  const windowEnd = localDayStart(to) + 86400000;\n\n  const files = collectFiles(root, windowStart, []);\n  const sessions = [];\n  const failed = [];\n  for (const f of files) {\n    try {\n      const s = await scanSessionFile(f, windowStart, windowEnd, adapter);\n      if (s) sessions.push(s);\n    } catch (e) {\n      failed.push({ file: path.basename(f.p), reason: String(e && e.message ? e.message : e).slice(0, 200) });\n    }\n  }\n\n  sessions.sort((a, b) => String(a.firstSeenAt).localeCompare(String(b.firstSeenAt)));\n\n  const totals = {\n    sessions: sessions.length,\n    userTurns: sessions.reduce((n, s) => n + s.userTurns, 0),\n    assistantTurns: sessions.reduce((n, s) => n + s.assistantTurns, 0),\n    toolCalls: sessions.reduce((n, s) => n + Object.values(s.tools).reduce((a, b) => a + b, 0), 0),\n    toolErrors: sessions.reduce((n, s) => n + s.toolErrors.length, 0),\n    editedFiles: new Set(sessions.flatMap((s) => s.editedFiles)).size,\n    workspaces: new Set(sessions.map((s) => s.workspace).filter(Boolean)).size,\n    filesScanned: files.length,\n    filesFailed: failed.length,\n  };\n\n  const payload = {\n    schema: \"worklog.facts.v1\",\n    engine: adapter.id,\n    engineLabel: adapter.label,\n    supportedEngines: Object.keys(ADAPTERS),\n    scannedAt: new Date().toISOString(),\n    range: { from, to, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },\n    root,\n    sessions,\n    workspaces: groupByWorkspace(sessions),\n    totals,\n    failures: failed,\n  };\n\n  const json = JSON.stringify(payload, null, 1);\n  if (args.out) {\n    // 结果可能超过宿主单流上限，写文件再让插件读回，避免 stdout 截断\n    fs.mkdirSync(path.dirname(args.out), { recursive: true });\n    fs.writeFileSync(args.out, json, \"utf8\");\n    process.stdout.write(\n      JSON.stringify({ ok: true, out: args.out, bytes: Buffer.byteLength(json), totals: totals }) + \"\\n\",\n    );\n    return;\n  }\n  process.stdout.write(json);\n}\n\nmain().catch((e) => {\n  process.stderr.write(\"scan failed: \" + (e && e.stack ? e.stack : e) + \"\\n\");\n  process.exit(1);\n});\n";
 
-// ---- 以下由 src/lib/*.mjs 内联生成 ----
-// ---- src/lib/feedback.mjs ----
+// ---- 以下由 ccgui-plugin-shared 内联生成 ----
+// ---- ccgui-plugin-shared/feedback.mjs ----
 /**
  * 反馈渠道的纯函数层：正文归一化、Issue 链接拼装、请求体收敛、响应文案。
  *
@@ -424,7 +424,7 @@ function describeQuota(quota) {
   return { remaining: 0, message: "本插件的反馈额度已用完，48 小时后再来", canRetry: true };
 }
 
-// ---- src/lib/feedback-net.mjs ----
+// ---- ccgui-plugin-shared/feedback-net.mjs ----
 /**
  * 反馈渠道的网络层：`send` 发一条反馈，`quota` 查今天还剩几条。
  *
@@ -571,7 +571,7 @@ function createFeedbackNet(ctx, opts) {
   return { send, quota };
 }
 
-// ---- src/lib/feedback-ui.mjs ----
+// ---- ccgui-plugin-shared/feedback-ui.mjs ----
 /**
  * 反馈区的行为层：状态、提交、额度、Issue 链接全在这里，四个插件共用。
  *
@@ -847,7 +847,7 @@ function useFeedbackForm(R, opts) {
   };
 }
 
-// ---- src/lib/markdown.mjs ----
+// ---- ccgui-plugin-shared/markdown.mjs ----
 /**
  * 解读正文用的 Markdown 子集解析。纯函数，输出的是「节点描述」而不是
  * HTML —— 渲染端自己把它们变成元素，避免把模型的输出当 HTML 执行。
@@ -1120,7 +1120,7 @@ function parseMarkdown(text) {
   return out;
 }
 
-// ---- src/lib/markdown-view.mjs ----
+// ---- ccgui-plugin-shared/markdown-view.mjs ----
 /**
  * 把 markdown.mjs 的块节点渲染成元素。
  *
@@ -1292,6 +1292,282 @@ function renderMarkdown(h, text, opts) {
   });
 }
 
+// ---- ccgui-plugin-shared/dropdown.mjs ----
+/**
+ * 自绘下拉菜单（不用原生 <select>）。
+ *
+ * 为什么必须自绘：Windows 下 <select> 会渲染成系统控件，和宿主完全不是一套外观。
+ *
+ * 为什么放进共用包：trending / worklog / leetcode 各写了一份，129 / 156 / 129 行，
+ * 行为一致但细节已经漂开——trending 有 ✓ 勾选和 hover 同步焦点，worklog 用的是
+ * 两套 keydown handler（菜单里方向键会失效），leetcode 用文本 "▾" 而不是 CSS 箭头。
+ * 每写一个新插件就重抄一遍，所以「下拉还有问题」反复出现。
+ *
+ * 库只产出**结构和类名**，不产出 CSS：类名固定为 `${prefix}-dd-*`，
+ * 配色由各插件自己的 token 决定（自建 token 与直接用宿主 token 两条路线并存，不强行统一）。
+ * 类名清单见 DROPDOWN_CLASS_SUFFIXES，validate-core 据此检查插件有没有把 CSS 写全。
+ */
+
+/** 下拉会产出的全部类名后缀。改这里必须同步改三个插件的 CSS。 */
+const DROPDOWN_CLASS_SUFFIXES = Object.freeze([
+  "trigger",
+  "value",
+  "caret",
+  "scrim",
+  "menu",
+  "group",
+  "item",
+  "label",
+  "check",
+  "empty",
+]);
+
+/**
+ * 浮层开合与方向。
+ *
+ * 向上弹的判断放在打开前做一次：菜单开着时再测，会把菜单自身的高度算进去。
+ */
+function useDdPopover(R) {
+  const openState = R.useState(false);
+  const upState = R.useState(false);
+  const triggerRef = R.useRef(null);
+
+  /** 打开前估一下菜单高度：下方不够且上方更宽裕时向上弹，免得被视口裁掉。 */
+  const openPopover = (estHeight) => {
+    const el = triggerRef.current;
+    let shouldUp = false;
+    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
+      const rect = el.getBoundingClientRect();
+      const below = (window.innerHeight || 800) - rect.bottom;
+      shouldUp = below < estHeight + 12 && rect.top > below;
+    }
+    upState[1](shouldUp);
+    openState[1](true);
+  };
+
+  return {
+    open: openState[0],
+    setOpen: openState[1],
+    up: upState[0],
+    triggerRef,
+    openPopover,
+  };
+}
+
+/**
+ * 造一个 Dropdown 组件。
+ *
+ * `getR` 是**取 React 的函数**而不是 React 本身：插件的 `appCtx` 要等 activate
+ * 才赋值，顶层写 `createDropdown(appCtx.react, ...)` 拿到的是 null。
+ *
+ * 选项形状：`{ value, label, disabled?, title?, group? }`
+ *   - `disabled` 可以是布尔值，也可以是 `isDisabled(item)` 回调——语义一样，
+ *     回调那种是给「禁用条件依赖选中值或外部状态」的调用方用的。
+ *   - `title` 会落到选项的 title 属性上，用于「仅名称 / 仅手动」这类
+ *     不看说明就看不懂的取值。
+ *   - `group` 相同的连续选项前面会插一条分组标题。
+ *
+ * @param {() => object} getR  返回 { useState, useRef, useEffect, createElement }
+ * @param {{ prefix: string }} opts  prefix 决定类名，如 "gt" → gt-dd-trigger
+ */
+function createDropdown(getR, opts) {
+  const prefix = (opts && opts.prefix) || "dd";
+  const base = prefix + "-dd";
+  const cls = (name) => base + "-" + name;
+
+  return function Dropdown(props) {
+    const R = getR();
+    const h = R.createElement;
+    const { open, setOpen, up, triggerRef, openPopover } = useDdPopover(R);
+    const focusState = R.useState(-1);
+    const focusIdx = focusState[0];
+    const setFocusIdx = focusState[1];
+    const itemRefs = R.useRef([]);
+
+    const items = Array.isArray(props.items) ? props.items : [];
+    const value = props.value == null ? "" : String(props.value);
+    const selectedIdx = items.findIndex((it) => String(it.value) === value);
+    const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
+    const placeholder = props.placeholder || "请选择";
+
+    /**
+     * 统一的禁用判断。
+     *
+     * 组件里每个用到「这一项能不能选」的地方都走它，不要有的地方读
+     * `item.disabled`、有的地方调回调——两套判断迟早分叉，表现是
+     * 「灰着但能点」或「能点但方向键跳过去了」。
+     */
+    const disabledOf = (item) => {
+      if (!item) return true;
+      if (typeof props.isDisabled === "function") return Boolean(props.isDisabled(item));
+      return Boolean(item.disabled);
+    };
+
+    R.useEffect(() => {
+      if (!open) return;
+      const el = itemRefs.current[focusIdx];
+      if (el && typeof el.focus === "function") el.focus();
+    }, [open, focusIdx]);
+
+    const openMenu = () => {
+      if (props.disabled || items.length === 0) return;
+      let i = selectedIdx;
+      if (i < 0) i = items.findIndex((it) => !disabledOf(it));
+      setFocusIdx(i < 0 ? 0 : i);
+      openPopover(Math.min(260, items.length * 32 + 8));
+    };
+
+    const choose = (item) => {
+      if (!item || disabledOf(item)) return;
+      setOpen(false);
+      if (String(item.value) !== value) props.onChange(item.value);
+    };
+
+    const move = (step) => {
+      if (!items.length) return;
+      let i = focusIdx;
+      for (let n = 0; n < items.length; n += 1) {
+        i = (i + step + items.length) % items.length;
+        if (!disabledOf(items[i])) break;
+      }
+      setFocusIdx(i);
+    };
+
+    /**
+     * 键盘处理挂在**容器**上，不是 trigger 上。
+     *
+     * 菜单一打开，useEffect 会把焦点移到 option 上（option 带 tabIndex=-1），
+     * 此后按键事件从 option 冒泡到容器。只挂在 trigger 上的话，打开之后方向键、
+     * Enter 确认、Esc 关闭全部失灵——只剩鼠标能用。
+     *
+     * 容器与 trigger 不能各挂一个：同一事件会冒泡两遍，Enter 会触发两次 onChange。
+     * 所以只有一个 handler，靠 ev.target 的 className 认来源。
+     */
+    const onKeyDown = (ev) => {
+      if (props.disabled) return;
+      // 按 className 认来源，不用 triggerRef.current：ref 在假宿主/替身里
+      // 未必被赋值，一旦为 null 判断就会恒假，空格键静默失效。
+      const t = ev && ev.target;
+      const onTrigger = Boolean(
+        t && typeof t.className === "string" && t.className.split(/\s+/).includes(cls("trigger")),
+      );
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        if (!open) openMenu();
+        else move(ev.key === "ArrowDown" ? 1 : -1);
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        if (open) choose(items[focusIdx]);
+        else openMenu();
+      } else if (ev.key === " ") {
+        // 空格只在 trigger 上当「打开」：菜单项里按空格同理会冒泡到这里，
+        // 但那是可滚动列表，别为了这个吃掉滚动键。
+        if (onTrigger) {
+          ev.preventDefault();
+          if (open) choose(items[focusIdx]);
+          else openMenu();
+        }
+      } else if (ev.key === "Escape" && open) {
+        ev.preventDefault();
+        setOpen(false);
+        // 焦点回到触发器：菜单关上后焦点若还留在已卸载的 option 上，
+        // 浏览器会把焦点丢回 body，接着按 Tab 就得从头走一遍整页。
+        const el = triggerRef.current;
+        if (el && typeof el.focus === "function") el.focus();
+      } else if (ev.key === "Tab" && open) {
+        // 焦点会离开这个组件；scrim 是 fixed 全屏，不关掉会留下一层看不见的
+        // 遮罩继续吞点击。
+        setOpen(false);
+      }
+    };
+
+    const noItems = items.length === 0;
+
+    return h(
+      "div",
+      {
+        // className 透传：调用方常靠它做布局（`.lc-settings .lc-dd { width:100% }`）。
+        className:
+          base +
+          (props.className ? " " + props.className : "") +
+          (open ? " is-open" : "") +
+          (up ? " is-up" : ""),
+        onKeyDown,
+      },
+      h(
+        "button",
+        {
+          type: "button",
+          className: cls("trigger"),
+          ref: triggerRef,
+          // 没有选项时也禁用：点开一个空菜单只会让人以为坏了。
+          disabled: props.disabled || noItems,
+          "aria-haspopup": "listbox",
+          "aria-expanded": open,
+          onClick: () => (open ? setOpen(false) : openMenu()),
+        },
+        h(
+          "span",
+          { className: cls("value") + (selected ? "" : " is-empty") },
+          selected ? selected.label : noItems ? props.emptyText || "没有可选项" : placeholder,
+        ),
+        h("span", { className: cls("caret"), "aria-hidden": "true" }),
+      ),
+      open ? h("div", { className: cls("scrim"), onClick: () => setOpen(false) }) : null,
+      open
+        ? h(
+            "div",
+            { className: cls("menu"), role: "listbox" },
+            items.length
+              ? items.reduce((rows, item, i) => {
+                  // 分组标题：只在组名变化时插一条，且不参与键盘焦点。
+                  // 不用「值相同的项必然相邻」这种假设——按出现顺序判断，
+                  // 调用方把同组项隔开就插两条标题，那是调用方的问题，不猜。
+                  const prevGroup = i > 0 ? items[i - 1].group : undefined;
+                  if (item.group && item.group !== prevGroup) {
+                    rows.push(
+                      h("div", { key: "g:" + item.group + ":" + i, className: cls("group") }, item.group),
+                    );
+                  }
+                  const dis = disabledOf(item);
+                  rows.push(
+                    h(
+                      "div",
+                      {
+                        // value 可能重复（不同分组的同名项），带上下标才唯一。
+                        key: String(item.value) + ":" + i,
+                        ref: (el) => {
+                          itemRefs.current[i] = el;
+                        },
+                        className:
+                          cls("item") +
+                          (i === focusIdx ? " is-active" : "") +
+                          (dis ? " is-disabled" : ""),
+                        role: "option",
+                        "aria-selected": String(item.value) === value,
+                        "aria-disabled": dis ? true : undefined,
+                        // 「仅名称 / 仅手动」这类取值，不看说明判断不了，
+                        // 悬停必须给出完整含义。
+                        title: item.title || undefined,
+                        tabIndex: -1,
+                        onClick: () => choose(item),
+                        onMouseEnter: () => {
+                          if (!dis) setFocusIdx(i);
+                        },
+                      },
+                      h("span", { className: cls("label") }, item.label),
+                      h("span", { className: cls("check"), "aria-hidden": "true" }, "✓"),
+                    ),
+                  );
+                  return rows;
+                }, [])
+              : h("div", { className: cls("empty") }, props.emptyText || "没有可选项"),
+          )
+        : null,
+    );
+  };
+}
+
 
 const CSS = `
 /* 设计方向：achromatic-ledger（浅色账本风格）。
@@ -1439,6 +1715,7 @@ html.dark .wl-dd-menu, .dark .wl-dd-menu { box-shadow:0 8px 24px rgba(0,0,0,.45)
 .wl-dd-label { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wl-dd-check { flex:none; font-size:12px; color:var(--wl-accent); opacity:0; }
 .wl-dd-item[aria-selected="true"] .wl-dd-check { opacity:1; }
+.wl-dd-group { padding:6px 10px 2px; font-size:11px; color:var(--wl-muted); user-select:none; }
 .wl-dd-empty { padding:8px 10px; font-size:12px; color:var(--wl-muted); }
 
 .wl-seg { display:inline-flex; padding:2px; gap:2px; border-radius:var(--wl-r-ctl); background:var(--wl-raised); border:1px solid var(--wl-border); }
@@ -5685,166 +5962,13 @@ function CenterTab() {
 }
 
 /**
- * 自绘下拉：按钮 + 列表，替代原生 select。
- * 原生 select 的展开层由系统绘制，宿主 WebView 里不跟随主题，字号与输入框也对不上。
- * items: [{ value, label, disabled? }]；value 用字符串比较，空字符串表示「自动」。
+ * 自绘下拉。实现在共用包 `ccgui-plugin-shared/dropdown`，构建期内联到本文件。
+ *
+ * 原来这里有一份 156 行的本地实现，键盘分两层挂（trigger 一组、菜单一组）：
+ * 菜单一打开焦点就移到选项上，trigger 的 handler 再也收不到事件，那段
+ * `onTriggerKeyDown` 实际只剩「打开菜单」一个作用。共用库统一挂在容器上。
  */
-function Dropdown(props) {
-  const R = appCtx.react;
-  const openState = R.useState(false);
-  const open = openState[0];
-  const setOpen = openState[1];
-  const focusState = R.useState(-1);
-  const focusIdx = focusState[0];
-  const setFocusIdx = focusState[1];
-  // 触发器下方空间不够时改为向上弹，避免菜单被视口底部裁掉
-  const upState = R.useState(false);
-  const up = upState[0];
-  const setUp = upState[1];
-  const triggerRef = R.useRef(null);
-  const itemRefs = R.useRef([]);
-
-  const items = props.items || [];
-  // value 既是按钮上显示的内容，也是「真正生效的那个」：两者不再分开。
-  // 空字符串表示未选中，显示 placeholder。
-  const value = props.value == null ? "" : String(props.value);
-  const selectedIdx = items.findIndex((it) => String(it.value) === value);
-  const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
-  const placeholder = props.placeholder || "请选择";
-
-  R.useEffect(() => {
-    if (!open) return;
-    const el = itemRefs.current[focusIdx];
-    if (el && typeof el.focus === "function") el.focus();
-  }, [open, focusIdx]);
-
-  const openMenu = () => {
-    if (props.disabled) return;
-    let i = selectedIdx;
-    if (i < 0) i = items.findIndex((it) => !it.disabled);
-    setFocusIdx(i < 0 ? 0 : i);
-    // 估算菜单高度：不超过 260，也不超过内容高度
-    const est = Math.min(260, items.length * 32 + 8);
-    const el = triggerRef.current;
-    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
-      const rect = el.getBoundingClientRect();
-      const below = (window.innerHeight || 800) - rect.bottom;
-      setUp(below < est + 12 && rect.top > below);
-    }
-    setOpen(true);
-  };
-
-  const choose = (item) => {
-    if (!item || item.disabled) return;
-    setOpen(false);
-    if (String(item.value) !== value) props.onChange(item.value);
-  };
-
-  const move = (step) => {
-    if (!items.length) return;
-    let i = focusIdx;
-    for (let n = 0; n < items.length; n++) {
-      i = (i + step + items.length) % items.length;
-      if (!items[i].disabled) break;
-    }
-    setFocusIdx(i);
-  };
-
-  const onTriggerKeyDown = (ev) => {
-    if (props.disabled) return;
-    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      if (!open) openMenu();
-      else move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      if (open) choose(items[focusIdx]);
-      else openMenu();
-    } else if (ev.key === "Escape" && open) {
-      ev.preventDefault();
-      setOpen(false);
-    }
-  };
-
-  // 焦点会被移到选项 div 上（见上面的 useEffect），此后 trigger 的
-  // onKeyDown 收不到事件：键盘操作必须在菜单上再接一层，
-  // 否则方向键、回车、Esc 在选项上全部失效。
-  const onMenuKeyDown = (ev) => {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      setOpen(false);
-      const el = triggerRef.current;
-      if (el && typeof el.focus === "function") el.focus();
-    } else if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      choose(items[focusIdx]);
-    } else if (ev.key === "Tab") {
-      // Tab 离开就收起，别把展开的菜单留在身后
-      setOpen(false);
-    }
-  };
-
-  return h(
-    "div",
-    { className: "wl-dd" + (open ? " is-open" : "") + (up ? " is-up" : "") },
-    h(
-      "button",
-      {
-        type: "button",
-        className: "wl-dd-trigger",
-        ref: triggerRef,
-        disabled: props.disabled,
-        "aria-haspopup": "listbox",
-        "aria-expanded": open,
-        onClick: () => (open ? setOpen(false) : openMenu()),
-        onKeyDown: onTriggerKeyDown,
-      },
-      h(
-        "span",
-        { className: "wl-dd-value" + (selected ? "" : " is-empty") },
-        selected ? selected.label : placeholder
-      ),
-      h("span", { className: "wl-dd-caret", "aria-hidden": "true" })
-    ),
-    open ? h("div", { className: "wl-dd-scrim", onClick: () => setOpen(false) }) : null,
-    open
-      ? h(
-          "div",
-          { className: "wl-dd-menu", role: "listbox", onKeyDown: onMenuKeyDown },
-          items.length
-            ? items.map((item, i) =>
-                h(
-                  "div",
-                  {
-                    key: String(item.value) + ":" + i,
-                    ref: (el) => {
-                      itemRefs.current[i] = el;
-                    },
-                    className:
-                      "wl-dd-item" +
-                      (i === focusIdx ? " is-active" : "") +
-                      (item.disabled ? " is-disabled" : ""),
-                    role: "option",
-                    "aria-selected": String(item.value) === value,
-                    "aria-disabled": item.disabled ? true : undefined,
-                    tabIndex: -1,
-                    onClick: () => choose(item),
-                    onMouseEnter: () => {
-                      if (!item.disabled) setFocusIdx(i);
-                    },
-                  },
-                  h("span", { className: "wl-dd-label" }, item.label),
-                  h("span", { className: "wl-dd-check", "aria-hidden": "true" }, "✓")
-                )
-              )
-            : h("div", { className: "wl-dd-empty" }, props.emptyText || "没有可选项")
-        )
-      : null
-  );
-}
+const Dropdown = createDropdown(() => appCtx.react, { prefix: "wl" });
 
 function EnvRow(props) {
   const item = props.item;
